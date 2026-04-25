@@ -2,9 +2,14 @@ name: Release
 
 on:
   push:
-    tags:
-      - '*'
-
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional tag/version string used for ldflags version metadata (e.g. v1.2.3)'
+        required: false
+        type: string
+        
 permissions:
   contents: write
 
