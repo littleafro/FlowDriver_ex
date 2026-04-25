@@ -1,0 +1,90 @@
+{
+  "storage_type": "google",
+  "server_id": "foreign-vps-01",
+  "tunnel_id": "main",
+  "data_dir": "./data-server",
+
+  "session_idle_timeout_ms": 300000,
+  "stale_unacked_file_ttl_ms": 1800000,
+  "tombstone_ttl_ms": 300000,
+  "cleanup_interval_ms": 30000,
+  "heartbeat_interval_ms": 30000,
+
+  "poll_rate_ms": 750,
+  "active_poll_rate_ms": 500,
+  "idle_poll_rate_ms": 3000,
+  "flush_rate_ms": 500,
+  "segment_bytes": 65536,
+  "max_segment_bytes": 262144,
+  "max_mux_segments": 32,
+
+  "max_concurrent_uploads": 4,
+  "max_concurrent_downloads": 4,
+  "max_concurrent_deletes": 2,
+  "max_pending_segments_per_session": 256,
+  "max_tx_buffer_bytes_per_session": 4194304,
+  "max_out_of_order_segments": 64,
+
+  "ack_every_segments": 8,
+  "ack_interval_ms": 1000,
+
+  "compression": "off",
+  "compression_min_bytes": 4096,
+
+  "dial_timeout_ms": 30000,
+  "tcp_keepalive_ms": 30000,
+  "block_private_ips": true,
+  "allow_cidrs": [],
+  "deny_cidrs": [],
+
+  "retry": {
+    "min_backoff_ms": 500,
+    "max_backoff_ms": 30000,
+    "backoff_multiplier": 2.0,
+    "jitter_percent": 25,
+    "max_retries_per_operation": 6,
+    "retry_forever_for_pending_uploads": true
+  },
+
+  "google_backends": [
+    {
+      "name": "g1",
+      "credentials_path": "./credentials-g1.json",
+      "folder_id": "GOOGLE_DRIVE_FOLDER_ID_1",
+      "token_url": "https://www.googleapis.com/oauth2/v4/token",
+      "weight": 1,
+      "enabled": true,
+      "transport": {
+        "target_ip": "216.239.38.120:443",
+        "sni": "google.com",
+        "host_header": "www.googleapis.com",
+        "insecure_skip_verify": false,
+        "connect_timeout_ms": 30000,
+        "tls_handshake_timeout_ms": 10000,
+        "request_timeout_ms": 60000,
+        "idle_conn_timeout_ms": 90000,
+        "max_idle_conns": 100,
+        "force_http2": true
+      },
+      "token_transport": {
+        "target_ip": "216.239.38.120:443",
+        "sni": "google.com",
+        "host_header": "www.googleapis.com",
+        "insecure_skip_verify": false,
+        "connect_timeout_ms": 30000,
+        "tls_handshake_timeout_ms": 10000,
+        "request_timeout_ms": 60000,
+        "idle_conn_timeout_ms": 90000,
+        "max_idle_conns": 100,
+        "force_http2": true
+      },
+      "rate_limits": {
+        "max_reads_per_second": 4,
+        "max_writes_per_second": 4,
+        "max_deletes_per_second": 2,
+        "max_requests_per_minute": 240,
+        "stop_when_budget_exhausted": false
+      }
+    }
+  ]
+}
