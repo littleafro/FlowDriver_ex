@@ -140,8 +140,8 @@ func (e *Engine) Start(ctx context.Context) {
 	if err := e.resetRecoveredState(ctx); err != nil {
 		log.Printf("reset recovered state failed: %v", err)
 	}
-	e.discardStartupBacklog(ctx)
 	e.applyBackendListCutoff()
+	e.discardStartupBacklog(ctx)
 	e.deleteAckedSegments(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
@@ -1197,6 +1197,13 @@ func (e *Engine) shouldDropStartupOpen(createdUnixMs int64) bool {
 
 func (e *Engine) discardStartupBacklog(ctx context.Context) {
 	for _, backend := range e.pool.Backends() {
+		if _, ok := backend.Backend.(interface {
+			SetListCreatedAfter(unixMs int64)
+		}); ok {
+			log.Printf("startup stale discard backend=%s mode=cutoff", backend.Name)
+			continue
+		}
+
 		segmentPrefix := string(e.peerDir) + "-"
 		if e.myDir == DirReq {
 			segmentPrefix += safeID(e.id) + "-"
