@@ -88,7 +88,9 @@ func (s *Server) handleConn(ctx context.Context, client net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(upstream, client)
-		if tcp, ok := upstream.(*net.TCPConn); ok {
+		if closeWriter, ok := upstream.(interface{ CloseWrite() error }); ok {
+			_ = closeWriter.CloseWrite()
+		} else if tcp, ok := upstream.(*net.TCPConn); ok {
 			_ = tcp.CloseWrite()
 		}
 	}()

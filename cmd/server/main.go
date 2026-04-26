@@ -64,6 +64,9 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	cancel()
+	shutdownCtx, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	engine.Shutdown(shutdownCtx)
 }
 
 func handleServerConn(ctx context.Context, session *transport.Session, policy *netutil.DialPolicy) {

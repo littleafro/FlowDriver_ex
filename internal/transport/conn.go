@@ -74,6 +74,11 @@ func (v *VirtualConn) Close() error {
 	return nil
 }
 
+func (v *VirtualConn) CloseWrite() error {
+	v.session.QueueClose()
+	return nil
+}
+
 func (v *VirtualConn) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 65535}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
@@ -102,4 +103,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	cancel()
+	shutdownCtx, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	engine.Shutdown(shutdownCtx)
 }

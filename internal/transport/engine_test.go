@@ -224,3 +224,81 @@ func TestRecoveredDirtyAckUploadsOnlyOnce(t *testing.T) {
 		t.Fatalf("expected recovered ack upload to stop after success, got %d puts", backend.PutCalls(filename))
 	}
 }
+
+func TestOrphanSegmentDiscardedAndAcked(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	env := &Envelope{
+		SessionID:     "ghost-session",
+		Seq:           3,
+		Kind:          KindData,
+		Payload:       []byte("orphan"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env.EnsureChecksum()
+	payload, compression, err := marshalSegmentPayload(env, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayload failed: %v", err)
+	}
+	meta := spoolSegmentMeta{
+		BackendName: "default",
+		Direction:   DirRes,
+		ClientID:    "c1",
+		SessionID:   "ghost-session",
+		Seq:         env.Seq,
+		RemoteName:  segmentFilename(DirRes, "c1", "ghost-session", env.Seq),
+		Compression: compression,
+	}
+	seg, err := engine.spool.SaveSegment(meta, payload)
+	if err != nil {
+		t.Fatalf("SaveSegment failed: %v", err)
+	}
+	data, err := seg.loadData()
+	if err != nil {
+		t.Fatalf("loadData failed: %v", err)
+	}
+	if err := backend.Upload(context.Background(), meta.RemoteName, bytes.NewReader(data)); err != nil {
+		t.Fatalf("backend upload failed: %v", err)
+	}
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), meta.RemoteName)
+	engine.flushAckStates(context.Background())
+
+	ackName := ackFilename(DirRes, "c1", "ghost-session")
+	if backend.PutCalls(ackName) != 1 {
+		t.Fatalf("expected orphan segment to produce one ack upload, got %d", backend.PutCalls(ackName))
+	}
+}
+
+func TestResetRecoveredStateDoesNotReuploadDeadSegments(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	session := NewSession("dead-session")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("hello"))
+	engine.flushAll(true, false)
+
+	segments := engine.pendingSnapshot()
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 pending segment, got %d", len(segments))
+	}
+	original := segments[0]
+	originalName := original.Meta.RemoteName
+
+	restart := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), true, "c1", engine.opts)
+	if err := restart.resetRecoveredState(context.Background()); err != nil {
+		t.Fatalf("resetRecoveredState failed: %v", err)
+	}
+	if got := len(restart.pendingSnapshot()); got != 0 {
+		t.Fatalf("expected no pending uploads after reset, got %d", got)
+	}
+	if _, err := restart.spool.LoadSegments(); err != nil {
+		t.Fatalf("LoadSegments failed: %v", err)
+	}
+	if backend.UploadCalls(originalName) != 0 {
+		t.Fatalf("expected no remote upload retries after reset, got %d", backend.UploadCalls(originalName))
+	}
+}

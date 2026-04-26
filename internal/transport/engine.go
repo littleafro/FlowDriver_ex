@@ -129,14 +129,50 @@ func (e *Engine) SetFlushRate(ms int) {
 }
 
 func (e *Engine) Start(ctx context.Context) {
-	if err := e.recoverLocalState(); err != nil {
-		log.Printf("recover local state failed: %v", err)
+	if err := e.resetRecoveredState(ctx); err != nil {
+		log.Printf("reset recovered state failed: %v", err)
 	}
+	e.deleteAckedSegments(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
 	go e.ackLoop(ctx)
 	go e.pollLoop(ctx)
 	go e.maintenanceLoop(ctx)
+}
+
+func (e *Engine) Shutdown(ctx context.Context) {
+	e.sessionMu.RLock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, s := range e.sessions {
+		sessions = append(sessions, s)
+	}
+	e.sessionMu.RUnlock()
+
+	for _, s := range sessions {
+		s.QueueClose()
+	}
+
+	e.flushAll(true, true)
+	e.triggerUploads(ctx)
+	e.flushAckStates(ctx)
+	e.deleteAckedSegments(ctx)
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if e.shutdownDrained() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.flushAll(true, true)
+			e.triggerUploads(ctx)
+			e.flushAckStates(ctx)
+			e.deleteAckedSegments(ctx)
+		}
+	}
 }
 
 func (e *Engine) GetSession(id string) *Session {
@@ -323,6 +359,9 @@ func (e *Engine) uploadLoop(ctx context.Context) {
 
 func (e *Engine) triggerUploads(ctx context.Context) {
 	for _, seg := range e.pendingSnapshot() {
+		if seg.Meta.Abandoned {
+			continue
+		}
 		if seg.Meta.Uploaded {
 			continue
 		}
@@ -491,9 +530,7 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 	if !ok || dir != e.peerDir {
 		return
 	}
-	if e.isClosedSession(sessionID) {
-		return
-	}
+	locallyClosed := e.isClosedSession(sessionID)
 
 	localAckKey := e.ackStateKey(backend.Name, ackFilename(e.peerDir, clientID, sessionID))
 	e.ackMu.Lock()
@@ -542,7 +579,7 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 	}
 
 	session := e.GetSession(sessionID)
-	if session == nil && e.myDir == DirRes && env.Kind == KindOpen && e.OnNewSession != nil {
+	if session == nil && !locallyClosed && e.myDir == DirRes && env.Kind == KindOpen && e.OnNewSession != nil {
 		session = NewSession(sessionID)
 		session.ClientID = clientID
 		session.BackendName = backend.Name
@@ -551,6 +588,12 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		go e.OnNewSession(sessionID, env.TargetAddr, session)
 	}
 	if session == nil {
+		e.ackMu.Lock()
+		e.seenRemote[backend.Name+"|"+name] = time.Now()
+		e.lastRx = time.Now()
+		e.ackMu.Unlock()
+		e.noteAck(backend.Name, clientID, sessionID, seq)
+		log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
 		return
 	}
 
@@ -652,6 +695,18 @@ func (e *Engine) cleanupSeenRemote() {
 
 func (e *Engine) deleteAckedSegments(ctx context.Context) {
 	for _, seg := range e.pendingSnapshot() {
+		abandoned := seg.Meta.Abandoned
+		if abandoned {
+			if !seg.Meta.Uploaded || seg.Meta.DeletedRemote {
+				if err := e.spool.DeleteSegment(seg); err != nil {
+					log.Printf("delete abandoned local spool failed %s: %v", seg.Meta.RemoteName, err)
+					continue
+				}
+				e.removePending(seg)
+				log.Printf("cleanup action backend=%s abandoned_local=%s", seg.Meta.BackendName, seg.Meta.RemoteName)
+				continue
+			}
+		}
 		if !seg.Meta.Uploaded {
 			continue
 		}
@@ -663,7 +718,7 @@ func (e *Engine) deleteAckedSegments(ctx context.Context) {
 		if seg.Meta.NextDeleteUnixMs > time.Now().UnixMilli() {
 			continue
 		}
-		if !e.isAcked(seg) {
+		if !abandoned && !e.isAcked(seg) {
 			if time.Since(time.UnixMilli(seg.Meta.CreatedUnixMs)) >= e.opts.StaleUnackedFileTTL {
 				log.Printf("stale unacked segment backend=%s file=%s age=%s", seg.Meta.BackendName, seg.Meta.RemoteName, time.Since(time.UnixMilli(seg.Meta.CreatedUnixMs)))
 			}
@@ -710,6 +765,7 @@ func (e *Engine) deleteSegment(ctx context.Context, backend *storage.BackendHand
 }
 
 func (e *Engine) cleanupSessions() {
+	now := time.Now()
 	e.sessionMu.RLock()
 	sessions := make([]*Session, 0, len(e.sessions))
 	for _, s := range e.sessions {
@@ -724,7 +780,7 @@ func (e *Engine) cleanupSessions() {
 		if e.pendingCountForSession(e.sessionScopedKey(s.BackendName, s.ClientID, s.ID)) > 0 {
 			continue
 		}
-		if time.Since(s.LastActivity()) >= e.opts.SessionIdleTimeout && s.HasCloseQueued() {
+		if s.ReadyForTeardown(now, e.closeDrainTimeout()) {
 			e.RemoveSession(s.ID)
 		}
 	}
@@ -789,6 +845,61 @@ func (e *Engine) recoverLocalState() error {
 		}
 	}
 	e.ackMu.Unlock()
+	return nil
+}
+
+func (e *Engine) resetRecoveredState(ctx context.Context) error {
+	if err := os.MkdirAll(e.opts.DataDir, 0755); err != nil {
+		return err
+	}
+
+	segments, err := e.spool.LoadSegments()
+	if err != nil {
+		return err
+	}
+
+	abandonedUploads := 0
+	removedLocal := 0
+	for _, seg := range segments {
+		if seg.Meta.Uploaded && !seg.Meta.DeletedRemote {
+			seg.Meta.Abandoned = true
+			seg.Meta.NextUploadUnixMs = 0
+			if err := seg.saveMeta(); err != nil {
+				return err
+			}
+			e.addPending(seg)
+			abandonedUploads++
+			continue
+		}
+		if err := e.spool.DeleteSegment(seg); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		removedLocal++
+	}
+
+	acks, err := e.spool.LoadAcks()
+	if err != nil {
+		return err
+	}
+	removedAcks := 0
+	for backendName, files := range acks {
+		backend := e.pool.Get(backendName)
+		for filename := range files {
+			if backend != nil {
+				if err := backend.Backend.Delete(ctx, filename); err != nil {
+					log.Printf("startup ack cleanup delete failed backend=%s file=%s: %v", backendName, filename, err)
+				}
+			}
+			if err := e.spool.DeleteAck(backendName, filename); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			removedAcks++
+		}
+	}
+
+	if abandonedUploads > 0 || removedLocal > 0 || removedAcks > 0 {
+		log.Printf("startup cleanup removed_local_segments=%d abandoned_uploaded_segments=%d removed_acks=%d", removedLocal, abandonedUploads, removedAcks)
+	}
 	return nil
 }
 
@@ -942,4 +1053,33 @@ func releaseSemaphore(sem chan struct{}) {
 	case <-sem:
 	default:
 	}
+}
+
+func (e *Engine) closeDrainTimeout() time.Duration {
+	timeout := e.opts.ActivePollRate * 2
+	if timeout < e.opts.FlushRate*2 {
+		timeout = e.opts.FlushRate * 2
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (e *Engine) shutdownDrained() bool {
+	e.pendingMu.RLock()
+	hasPending := len(e.pending) > 0
+	e.pendingMu.RUnlock()
+	if hasPending {
+		return false
+	}
+
+	e.ackMu.Lock()
+	defer e.ackMu.Unlock()
+	for _, dirty := range e.ackDirtyCounts {
+		if dirty > 0 {
+			return false
+		}
+	}
+	return true
 }

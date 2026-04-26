@@ -307,3 +307,19 @@ func (s *Session) CanHeartbeat(now time.Time, heartbeatInterval time.Duration) b
 	}
 	return now.Sub(s.lastHeartbeatTx) >= heartbeatInterval
 }
+
+func (s *Session) ReadyForTeardown(now time.Time, grace time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.txBuf) > 0 {
+		return false
+	}
+	if s.rxClosed {
+		return true
+	}
+	if s.closeQueued || s.closeSent || s.closed {
+		return now.Sub(s.lastActivity) >= grace
+	}
+	return false
+}

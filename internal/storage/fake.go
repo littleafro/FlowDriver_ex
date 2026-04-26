@@ -19,8 +19,10 @@ type fakeFile struct {
 type FakeBackend struct {
 	mu sync.Mutex
 
-	files map[string][]fakeFile
-	puts  map[string]int
+	files   map[string][]fakeFile
+	puts    map[string]int
+	uploads map[string]int
+	deletes map[string]int
 
 	uploadFailures   int
 	listFailures     int
@@ -36,6 +38,8 @@ func NewFakeBackend() *FakeBackend {
 	return &FakeBackend{
 		files:         make(map[string][]fakeFile),
 		puts:          make(map[string]int),
+		uploads:       make(map[string]int),
+		deletes:       make(map[string]int),
 		duplicateList: make(map[string]int),
 		quotaFailures: make(map[string]int),
 	}
@@ -60,6 +64,7 @@ func (b *FakeBackend) Upload(ctx context.Context, filename string, data io.Reade
 	if err != nil {
 		return err
 	}
+	b.uploads[filename]++
 	b.files[filename] = append(b.files[filename], fakeFile{
 		data:      payload,
 		visibleAt: time.Now().Add(b.visibilityDelay),
@@ -142,6 +147,7 @@ func (b *FakeBackend) Delete(ctx context.Context, filename string) error {
 	if err := b.fail("delete"); err != nil {
 		return err
 	}
+	b.deletes[filename]++
 	delete(b.files, filename)
 	return nil
 }
@@ -193,6 +199,18 @@ func (b *FakeBackend) PutCalls(filename string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.puts[filename]
+}
+
+func (b *FakeBackend) UploadCalls(filename string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.uploads[filename]
+}
+
+func (b *FakeBackend) DeleteCalls(filename string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.deletes[filename]
 }
 
 func (b *FakeBackend) fail(op string) error {

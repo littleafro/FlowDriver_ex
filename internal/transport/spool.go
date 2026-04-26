@@ -67,6 +67,7 @@ type spoolSegmentMeta struct {
 	SessionID        string    `json:"session_id"`
 	Seq              uint64    `json:"seq"`
 	RemoteName       string    `json:"remote_name"`
+	Abandoned        bool      `json:"abandoned,omitempty"`
 	Uploaded         bool      `json:"uploaded"`
 	UploadAttempts   int       `json:"upload_attempts"`
 	NextUploadUnixMs int64     `json:"next_upload_unix_ms"`
@@ -286,6 +287,16 @@ func (s *spoolStore) LoadAcks() (map[string]map[string]ackStoreRecord, error) {
 		return nil
 	})
 	return result, err
+}
+
+func (s *spoolStore) DeleteAck(backendName, filename string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.ackPath(backendName, filename)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func decodeAckStoreRecord(payload []byte) (ackStoreRecord, error) {
