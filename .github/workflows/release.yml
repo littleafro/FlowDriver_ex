@@ -30,6 +30,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+
+          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "workflow_dispatch requires release_tag when not running from a tag ref" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -38,7 +55,7 @@ jobs:
       - name: Build Binaries
         shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME}
+          VERSION="${{ steps.meta.outputs.tag }}"
           FOLDER_NAME="flow-driver-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p $FOLDER_NAME
           
@@ -59,6 +76,9 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.tag }}
           files: flow-driver-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

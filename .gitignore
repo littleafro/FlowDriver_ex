@@ -11,3 +11,5 @@ bin/
 /server
 /client
 go1.26/
+/client_config.json
+/server_config.json
