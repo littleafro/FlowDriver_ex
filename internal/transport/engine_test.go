@@ -373,6 +373,84 @@ func TestClientOrphanSeqSkipsDownload(t *testing.T) {
 	}
 }
 
+func TestServerBuffersPreOpenSegmentUntilOpenArrives(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	sessionID := "pre-open"
+	ackName := ackFilename(DirReq, "c1", sessionID)
+
+	dataEnv := &Envelope{
+		SessionID:     sessionID,
+		Seq:           1,
+		Kind:          KindData,
+		Payload:       []byte("hello"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	dataEnv.EnsureChecksum()
+	dataPayload, _, err := marshalSegmentPayload(dataEnv, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayload(data) failed: %v", err)
+	}
+	dataName := segmentFilename(DirReq, "c1", sessionID, dataEnv.Seq)
+	if err := backend.Upload(context.Background(), dataName, bytes.NewReader(dataPayload)); err != nil {
+		t.Fatalf("backend upload(data) failed: %v", err)
+	}
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), dataName)
+	engine.flushAckStates(context.Background())
+
+	if s := engine.GetSession(sessionID); s != nil {
+		t.Fatalf("server should not create a session before open arrives")
+	}
+	if backend.PutCalls(ackName) != 0 {
+		t.Fatalf("pre-open data must not be acked before open, got %d ack uploads", backend.PutCalls(ackName))
+	}
+
+	openEnv := &Envelope{
+		SessionID:     sessionID,
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "1.1.1.1:443",
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	openEnv.EnsureChecksum()
+	openPayload, _, err := marshalSegmentPayload(openEnv, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayload(open) failed: %v", err)
+	}
+	openName := segmentFilename(DirReq, "c1", sessionID, openEnv.Seq)
+	if err := backend.Upload(context.Background(), openName, bytes.NewReader(openPayload)); err != nil {
+		t.Fatalf("backend upload(open) failed: %v", err)
+	}
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), openName)
+
+	session := engine.GetSession(sessionID)
+	if session == nil {
+		t.Fatalf("server should create a session once open arrives")
+	}
+
+	select {
+	case got := <-session.RxChan:
+		if string(got) != "hello" {
+			t.Fatalf("unexpected buffered payload %q", got)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for buffered payload delivery")
+	}
+
+	engine.flushAckStates(context.Background())
+
+	key := engine.ackStateKey("default", ackName)
+	engine.ackMu.Lock()
+	ack := engine.ackStates[key]
+	engine.ackMu.Unlock()
+	if ack.AckedSeq != 1 {
+		t.Fatalf("expected acked_seq=1 after replaying buffered data, got %d", ack.AckedSeq)
+	}
+}
+
 func TestDownloadNotFoundDebouncedBySeenCache(t *testing.T) {
 	t.Parallel()
 

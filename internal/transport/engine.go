@@ -31,6 +31,12 @@ type metrics struct {
 	deleteErrors       uint64
 }
 
+type preOpenSegment struct {
+	remoteName string
+	env        *Envelope
+	bufferedAt time.Time
+}
+
 type Engine struct {
 	pool    *storage.BackendPool
 	myDir   Direction
@@ -74,6 +80,9 @@ type Engine struct {
 	ackPollMu   sync.Mutex
 	ackLastPoll map[string]time.Time
 
+	preOpenMu sync.Mutex
+	preOpen   map[string]map[uint64]*preOpenSegment
+
 	OnNewSession func(sessionID, targetAddr string, s *Session)
 }
 
@@ -107,6 +116,7 @@ func NewEngineWithPool(pool *storage.BackendPool, isClient bool, clientID string
 		lastRx:           time.Now(),
 		lastMetricsLog:   time.Now(),
 		ackLastPoll:      make(map[string]time.Time),
+		preOpen:          make(map[string]map[uint64]*preOpenSegment),
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -611,9 +621,6 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 	case session == nil && e.myDir == DirReq:
 		// Client side never accepts peer-initiated sessions.
 		shouldAckWithoutDownload = true
-	case session == nil && seq > 0:
-		// If open(0) was never observed locally, higher seq segments are stale/orphaned.
-		shouldAckWithoutDownload = true
 	case session == nil && locallyClosed:
 		shouldAckWithoutDownload = true
 	}
@@ -692,6 +699,15 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 			go e.OnNewSession(sessionID, env.TargetAddr, session)
 		}
 	}
+	if session == nil && !locallyClosed && e.myDir == DirRes && seq > 0 {
+		if e.bufferPreOpenSegment(backend.Name, clientID, sessionID, name, env) {
+			e.markSeenRemote(backend.Name, name)
+			log.Printf("buffered pre-open segment backend=%s file=%s session=%s seq=%d", backend.Name, name, sessionID, seq)
+			return
+		}
+		log.Printf("pre-open buffer full backend=%s file=%s session=%s seq=%d", backend.Name, name, sessionID, seq)
+		return
+	}
 	if session == nil {
 		e.markSeenRemote(backend.Name, name)
 		e.noteAck(backend.Name, clientID, sessionID, seq)
@@ -701,29 +717,12 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
-	ackedSeq, advanced, closedNow, err := session.ProcessRx(env)
-	if err != nil {
-		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, seq, err)
-		return
-	}
 	e.markSeenRemote(backend.Name, name)
-	if advanced {
-		e.noteAck(backend.Name, clientID, sessionID, ackedSeq)
-		e.ackMu.Lock()
-		e.lastRx = time.Now()
-		e.ackMu.Unlock()
-		if closedNow {
-			e.markClosedSession(sessionID)
+	e.applyReceivedSegment(backend.Name, clientID, sessionID, name, session, env)
+	if env.Kind == KindOpen {
+		for _, pending := range e.takePreOpenSegments(backend.Name, clientID, sessionID) {
+			e.applyReceivedSegment(backend.Name, clientID, sessionID, pending.remoteName, session, pending.env)
 		}
-		e.metrics.mu.Lock()
-		e.metrics.segmentsDownloaded++
-		if e.peerDir == DirReq {
-			e.metrics.bytesC2S += uint64(len(env.Payload))
-		} else {
-			e.metrics.bytesS2C += uint64(len(env.Payload))
-		}
-		e.metrics.mu.Unlock()
-		log.Printf("segment downloaded backend=%s file=%s seq=%d", backend.Name, name, seq)
 	}
 }
 
@@ -771,6 +770,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 		case <-ticker.C:
 			e.cleanupClosedSessions()
 			e.cleanupSeenRemote()
+			e.cleanupPreOpenSegments()
 			e.deleteAckedSegments(ctx)
 			e.cleanupSessions()
 			e.logMetrics()
@@ -1124,6 +1124,106 @@ func (e *Engine) noteAck(backendName, clientID, sessionID string, ackedSeq uint6
 	if _, err := e.spool.SaveAck(backendName, filename, ack); err != nil {
 		log.Printf("save ack state failed backend=%s file=%s: %v", backendName, filename, err)
 	}
+}
+
+func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteName string, env *Envelope) bool {
+	key := e.sessionScopedKey(backendName, clientID, sessionID)
+
+	e.preOpenMu.Lock()
+	defer e.preOpenMu.Unlock()
+
+	bucket := e.preOpen[key]
+	if bucket == nil {
+		bucket = make(map[uint64]*preOpenSegment)
+		e.preOpen[key] = bucket
+	}
+	if _, exists := bucket[env.Seq]; exists {
+		return true
+	}
+	if len(bucket) >= e.opts.MaxOutOfOrderSegments {
+		return false
+	}
+
+	copyEnv := *env
+	copyEnv.Payload = append([]byte(nil), env.Payload...)
+	bucket[env.Seq] = &preOpenSegment{
+		remoteName: remoteName,
+		env:        &copyEnv,
+		bufferedAt: time.Now(),
+	}
+	return true
+}
+
+func (e *Engine) takePreOpenSegments(backendName, clientID, sessionID string) []*preOpenSegment {
+	key := e.sessionScopedKey(backendName, clientID, sessionID)
+
+	e.preOpenMu.Lock()
+	bucket := e.preOpen[key]
+	delete(e.preOpen, key)
+	e.preOpenMu.Unlock()
+
+	if len(bucket) == 0 {
+		return nil
+	}
+
+	out := make([]*preOpenSegment, 0, len(bucket))
+	for _, seg := range bucket {
+		out = append(out, seg)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].env.Seq < out[j].env.Seq
+	})
+	return out
+}
+
+func (e *Engine) cleanupPreOpenSegments() {
+	ttl := e.opts.StaleUnackedFileTTL
+	if ttl <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-ttl)
+
+	e.preOpenMu.Lock()
+	defer e.preOpenMu.Unlock()
+
+	for key, bucket := range e.preOpen {
+		for seq, seg := range bucket {
+			if seg.bufferedAt.Before(cutoff) {
+				delete(bucket, seq)
+			}
+		}
+		if len(bucket) == 0 {
+			delete(e.preOpen, key)
+		}
+	}
+}
+
+func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteName string, session *Session, env *Envelope) {
+	ackedSeq, advanced, closedNow, err := session.ProcessRx(env)
+	if err != nil {
+		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, env.Seq, err)
+		return
+	}
+	if !advanced {
+		return
+	}
+
+	e.noteAck(backendName, clientID, sessionID, ackedSeq)
+	e.ackMu.Lock()
+	e.lastRx = time.Now()
+	e.ackMu.Unlock()
+	if closedNow {
+		e.markClosedSession(sessionID)
+	}
+	e.metrics.mu.Lock()
+	e.metrics.segmentsDownloaded++
+	if e.peerDir == DirReq {
+		e.metrics.bytesC2S += uint64(len(env.Payload))
+	} else {
+		e.metrics.bytesS2C += uint64(len(env.Payload))
+	}
+	e.metrics.mu.Unlock()
+	log.Printf("segment downloaded backend=%s file=%s seq=%d", backendName, remoteName, env.Seq)
 }
 
 func (e *Engine) isAcked(seg *spoolSegment) bool {

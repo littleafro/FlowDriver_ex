@@ -39,18 +39,26 @@ jobs:
         shell: bash
         run: |
           TAG="${{ github.event.inputs.release_tag }}"
+          REF_TYPE="${{ github.ref_type }}"
 
-          if [ -z "$TAG" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ -z "$TAG" ] && [ "$REF_TYPE" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
           fi
 
+          POINTING_TAG="$(git tag --points-at "$GITHUB_SHA" | grep -E '^v' | head -n1 || true)"
           if [ -z "$TAG" ]; then
-            TAG="$(git tag --points-at "$GITHUB_SHA" | grep -E '^v' | head -n1 || true)"
+            TAG="$POINTING_TAG"
           fi
 
           if [ -z "$TAG" ]; then
+            SHORT_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            TAG="auto-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            echo "Auto-generated release tag: $TAG"
+          fi
+
+          if [ "$REF_TYPE" = "branch" ] && [ -n "$POINTING_TAG" ] && [ "$TAG" = "$POINTING_TAG" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "No v* tag found for commit $GITHUB_SHA. Push the tag ref too (e.g. git push origin vX.Y.Z or git push --follow-tags)." >&2
+            echo "This commit already has version tag $POINTING_TAG; skipping branch push release to avoid duplicate releases."
             exit 0
           fi
 
