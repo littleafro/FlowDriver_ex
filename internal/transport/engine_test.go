@@ -208,6 +208,79 @@ func TestProcessMuxFileDeletesRemoteObjectAfterDelivery(t *testing.T) {
 	}
 }
 
+func TestProcessMuxFileRetainsFileUntilAllEnvelopesCanBeApplied(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	session := NewSession("s1")
+	engine.AddSession(session)
+
+	session.mu.Lock()
+	session.maxOutOfOrder = 0
+	session.mu.Unlock()
+
+	dataEnv := &Envelope{
+		SessionID:     "s1",
+		Seq:           1,
+		Kind:          KindData,
+		Payload:       []byte("one"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	dataEnv.EnsureChecksum()
+	dataPayload, _, err := marshalSegmentPayloads([]*Envelope{dataEnv}, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayloads(data) failed: %v", err)
+	}
+	dataName := muxFilename(DirReq, "c1", time.Now().Add(-2*time.Second).UnixNano())
+	if err := backend.Upload(context.Background(), dataName, bytes.NewReader(dataPayload)); err != nil {
+		t.Fatalf("backend upload(data) failed: %v", err)
+	}
+
+	engine.processMuxFile(context.Background(), engine.pool.Get("default"), dataName)
+
+	if !backend.HasFile(dataName) {
+		t.Fatalf("mux file with unapplied data should remain remote for retry")
+	}
+
+	engine.ackMu.Lock()
+	_, seen := engine.seenRemote["default|"+dataName]
+	engine.ackMu.Unlock()
+	if seen {
+		t.Fatalf("failed mux file must not be hidden behind seen cache")
+	}
+
+	openEnv := &Envelope{
+		SessionID:     "s1",
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "1.1.1.1:443",
+		Payload:       []byte("zero"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	openEnv.EnsureChecksum()
+	openPayload, _, err := marshalSegmentPayloads([]*Envelope{openEnv}, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayloads(open) failed: %v", err)
+	}
+	openName := muxFilename(DirReq, "c1", time.Now().Add(-time.Second).UnixNano())
+	if err := backend.Upload(context.Background(), openName, bytes.NewReader(openPayload)); err != nil {
+		t.Fatalf("backend upload(open) failed: %v", err)
+	}
+
+	engine.processMuxFile(context.Background(), engine.pool.Get("default"), openName)
+	engine.processMuxFile(context.Background(), engine.pool.Get("default"), dataName)
+
+	if backend.HasFile(dataName) {
+		t.Fatalf("mux file should delete after retry succeeds")
+	}
+
+	got0 := <-session.RxChan
+	got1 := <-session.RxChan
+	if string(got0) != "zero" || string(got1) != "one" {
+		t.Fatalf("unexpected retried mux delivery order %q %q", got0, got1)
+	}
+}
+
 func TestRecoveredCleanAckDoesNotReupload(t *testing.T) {
 	t.Parallel()
 

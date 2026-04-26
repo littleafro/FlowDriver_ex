@@ -867,10 +867,10 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
-	e.applyReceivedSegments(backend.Name, clientID, sessionID, name, session, envs, true)
+	e.applyReceivedSegments(backend.Name, clientID, sessionID, name, session, envs, true, true)
 	if firstEnv.Kind == KindOpen {
 		for _, pending := range e.takePreOpenSegments(backend.Name, clientID, sessionID) {
-			e.applyReceivedSegments(backend.Name, clientID, sessionID, pending.remoteName, session, pending.envs, pending.needsAck)
+			e.applyReceivedSegments(backend.Name, clientID, sessionID, pending.remoteName, session, pending.envs, pending.needsAck, true)
 		}
 	}
 }
@@ -927,6 +927,7 @@ func (e *Engine) processMuxFile(ctx context.Context, backend *storage.BackendHan
 		return
 	}
 
+	handledAll := true
 	for _, env := range envs {
 		locallyClosed := e.isClosedSession(env.SessionID)
 		session := e.GetSession(env.SessionID)
@@ -954,8 +955,9 @@ func (e *Engine) processMuxFile(ctx context.Context, backend *storage.BackendHan
 
 		if session == nil && !locallyClosed && e.myDir == DirRes && env.Seq > 0 {
 			if e.bufferPreOpenSegment(backend.Name, clientID, env.SessionID, name, []*Envelope{env}, false) {
-				e.markSeenRemote(backend.Name, name)
+				continue
 			}
+			handledAll = false
 			continue
 		}
 
@@ -963,15 +965,27 @@ func (e *Engine) processMuxFile(ctx context.Context, backend *storage.BackendHan
 			continue
 		}
 
-		e.applyReceivedSegment(backend.Name, clientID, env.SessionID, name, session, env, false)
+		if !e.applyReceivedSegment(backend.Name, clientID, env.SessionID, name, session, env, false, false) {
+			handledAll = false
+			continue
+		}
 		if env.Kind == KindOpen {
 			for _, pending := range e.takePreOpenSegments(backend.Name, clientID, env.SessionID) {
-				e.applyReceivedSegments(backend.Name, clientID, env.SessionID, pending.remoteName, session, pending.envs, pending.needsAck)
+				if !e.applyReceivedSegments(backend.Name, clientID, env.SessionID, pending.remoteName, session, pending.envs, pending.needsAck, false) {
+					handledAll = false
+					break
+				}
 			}
 		}
 	}
 
+	if !handledAll {
+		log.Printf("mux deferred backend=%s file=%s waiting_for_retry=true", backend.Name, name)
+		return
+	}
+
 	if err := backend.Backend.Delete(ctx, name); err != nil {
+		e.markSeenRemote(backend.Name, name)
 		log.Printf("mux delete error backend=%s file=%s: %v", backend.Name, name, err)
 	} else {
 		log.Printf("cleanup action backend=%s deleted=%s", backend.Name, name)
@@ -1546,25 +1560,32 @@ func (e *Engine) cleanupPreOpenSegments() {
 	}
 }
 
-func (e *Engine) applyReceivedSegments(backendName, clientID, sessionID, remoteName string, session *Session, envs []*Envelope, needsAck bool) {
+func (e *Engine) applyReceivedSegments(backendName, clientID, sessionID, remoteName string, session *Session, envs []*Envelope, needsAck, markSeen bool) bool {
 	if len(envs) == 0 {
-		e.markSeenRemote(backendName, remoteName)
-		return
+		if markSeen {
+			e.markSeenRemote(backendName, remoteName)
+		}
+		return true
 	}
 	for _, env := range envs {
-		e.applyReceivedSegment(backendName, clientID, sessionID, remoteName, session, env, needsAck)
+		if !e.applyReceivedSegment(backendName, clientID, sessionID, remoteName, session, env, needsAck, markSeen) {
+			return false
+		}
 	}
+	return true
 }
 
-func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteName string, session *Session, env *Envelope, needsAck bool) {
+func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteName string, session *Session, env *Envelope, needsAck, markSeen bool) bool {
 	ackedSeq, advanced, closedNow, err := session.ProcessRx(env)
 	if err != nil {
 		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, env.Seq, err)
-		return
+		return false
 	}
-	e.markSeenRemote(backendName, remoteName)
+	if markSeen {
+		e.markSeenRemote(backendName, remoteName)
+	}
 	if !advanced {
-		return
+		return true
 	}
 
 	if needsAck {
@@ -1585,6 +1606,7 @@ func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteNa
 	}
 	e.metrics.mu.Unlock()
 	log.Printf("segment downloaded backend=%s file=%s seq=%d", backendName, remoteName, env.Seq)
+	return true
 }
 
 func (e *Engine) isAcked(seg *spoolSegment) bool {
