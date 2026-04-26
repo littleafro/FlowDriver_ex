@@ -60,6 +60,7 @@ type GoogleBackend struct {
 	refreshToken string
 	tokenEx      time.Time
 	mu           sync.Mutex
+	listAfterMs  int64
 
 	fileIDs   map[string]string
 	fileIDsMu sync.RWMutex
@@ -219,6 +220,21 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 
 	b.setHealth(HealthHealthy)
 	return nil
+}
+
+func (b *GoogleBackend) SetListCreatedAfter(unixMs int64) {
+	if unixMs < 0 {
+		unixMs = 0
+	}
+	b.mu.Lock()
+	b.listAfterMs = unixMs
+	b.mu.Unlock()
+}
+
+func (b *GoogleBackend) listCreatedAfter() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.listAfterMs
 }
 
 func (b *GoogleBackend) exchangeCodeLocked(ctx context.Context, code string) error {
@@ -660,6 +676,9 @@ func (b *GoogleBackend) listFiles(ctx context.Context, prefix string) ([]googleF
 	query := fmt.Sprintf("name contains '%s' and trashed = false", escapeDriveQuery(prefix))
 	if b.folderID != "" {
 		query += fmt.Sprintf(" and '%s' in parents", b.folderID)
+	}
+	if createdAfter := b.listCreatedAfter(); createdAfter > 0 {
+		query += fmt.Sprintf(" and createdTime > '%s'", time.UnixMilli(createdAfter).UTC().Format(time.RFC3339))
 	}
 	return b.queryFiles(ctx, query)
 }
