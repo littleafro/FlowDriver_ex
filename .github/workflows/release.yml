@@ -24,18 +24,7 @@ jobs:
             arch: amd64
             goos: linux
             goarch: amd64
-          - os: windows
-            arch: amd64
-            goos: windows
-            goarch: amd64
-          - os: macOS-amd64
-            arch: amd64
-            goos: darwin
-            goarch: amd64
-          - os: macOS-arm64
-            arch: arm64
-            goos: darwin
-            goarch: arm64
+
 
     steps:
       - name: Checkout code
