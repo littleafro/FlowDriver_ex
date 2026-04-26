@@ -1037,7 +1037,6 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			e.cleanupClosedSessions()
 			e.cleanupSeenRemote()
 			e.cleanupPreOpenSegments()
-			e.cleanupRemoteStaleFiles(ctx)
 			e.deleteAckedSegments(ctx)
 			e.cleanupSessions()
 			e.logMetrics()
@@ -1325,7 +1324,14 @@ func (e *Engine) warmRemoteDeleteCache(ctx context.Context, segmentBackends, ack
 }
 
 func (e *Engine) remoteStaleFileTTL() time.Duration {
-	return 30 * time.Second
+	ttl := e.opts.StaleUnackedFileTTL
+	if ttl < e.opts.SessionIdleTimeout {
+		ttl = e.opts.SessionIdleTimeout
+	}
+	if ttl < 10*time.Minute {
+		ttl = 10 * time.Minute
+	}
+	return ttl
 }
 
 func (e *Engine) cleanupRemoteStaleFiles(ctx context.Context) {
