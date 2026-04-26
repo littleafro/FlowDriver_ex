@@ -36,6 +36,7 @@ type FakeBackend struct {
 	reverseList      bool
 	quotaFailures    map[string]int
 	listAfterMs      int64
+	downloadDelay    map[string]time.Duration
 }
 
 func NewFakeBackend() *FakeBackend {
@@ -47,6 +48,7 @@ func NewFakeBackend() *FakeBackend {
 		deletes:       make(map[string]int),
 		duplicateList: make(map[string]int),
 		quotaFailures: make(map[string]int),
+		downloadDelay: make(map[string]time.Duration),
 	}
 }
 
@@ -135,6 +137,13 @@ func (b *FakeBackend) ListQuery(ctx context.Context, prefix string) ([]string, e
 
 func (b *FakeBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
 	b.mu.Lock()
+	delay := b.downloadDelay[filename]
+	b.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
+	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.downloads[filename]++
 	if err := b.fail("download"); err != nil {
@@ -204,6 +213,12 @@ func (b *FakeBackend) SetDuplicateListing(filename string, duplicates int) {
 func (b *FakeBackend) SetReverseList(reverse bool) {
 	b.mu.Lock()
 	b.reverseList = reverse
+	b.mu.Unlock()
+}
+
+func (b *FakeBackend) SetDownloadDelay(filename string, delay time.Duration) {
+	b.mu.Lock()
+	b.downloadDelay[filename] = delay
 	b.mu.Unlock()
 }
 

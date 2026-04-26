@@ -451,6 +451,63 @@ func TestServerBuffersPreOpenSegmentUntilOpenArrives(t *testing.T) {
 	}
 }
 
+func TestPollBackendProcessesSingleSessionInOrder(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	engine.opts.MaxConcurrentDownloads = 3
+	engine.opts.MaxOutOfOrderSegments = 1
+
+	sessionID := "ordered-poll"
+	makeSegment := func(seq uint64, kind EnvelopeKind, target string, payload string) string {
+		env := &Envelope{
+			SessionID:     sessionID,
+			Seq:           seq,
+			Kind:          kind,
+			TargetAddr:    target,
+			Payload:       []byte(payload),
+			CreatedUnixMs: time.Now().UnixMilli(),
+		}
+		env.EnsureChecksum()
+		encoded, _, err := marshalSegmentPayload(env, "off", 0)
+		if err != nil {
+			t.Fatalf("marshalSegmentPayload seq=%d failed: %v", seq, err)
+		}
+		name := segmentFilename(DirReq, "c1", sessionID, seq)
+		if err := backend.Upload(context.Background(), name, bytes.NewReader(encoded)); err != nil {
+			t.Fatalf("backend upload seq=%d failed: %v", seq, err)
+		}
+		return name
+	}
+
+	name0 := makeSegment(0, KindOpen, "1.1.1.1:443", "zero")
+	makeSegment(1, KindData, "", "one")
+	makeSegment(2, KindData, "", "two")
+	backend.SetDownloadDelay(name0, 150*time.Millisecond)
+
+	engine.pollBackend(context.Background(), engine.pool.Get("default"))
+
+	session := engine.GetSession(sessionID)
+	if session == nil {
+		t.Fatalf("expected session to be created")
+	}
+
+	got0 := <-session.RxChan
+	got1 := <-session.RxChan
+	got2 := <-session.RxChan
+	if string(got0) != "zero" || string(got1) != "one" || string(got2) != "two" {
+		t.Fatalf("unexpected delivery order %q %q %q", got0, got1, got2)
+	}
+
+	key := engine.ackStateKey("default", ackFilename(DirReq, "c1", sessionID))
+	engine.ackMu.Lock()
+	ack := engine.ackStates[key]
+	engine.ackMu.Unlock()
+	if ack.AckedSeq != 2 {
+		t.Fatalf("expected acked_seq=2 after ordered poll processing, got %d", ack.AckedSeq)
+	}
+}
+
 func TestDownloadNotFoundDebouncedBySeenCache(t *testing.T) {
 	t.Parallel()
 

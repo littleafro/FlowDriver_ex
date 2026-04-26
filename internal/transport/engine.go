@@ -555,29 +555,45 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 		return
 	}
 	segmentFiles = e.filterSeenRemote(backend.Name, segmentFiles)
+	sessionBatches := make(map[string][]string)
+	sessionOrder := make([]string, 0)
+	for _, name := range segmentFiles {
+		dir, clientID, sessionID, _, ok := parseSegmentFilename(name)
+		if !ok || dir != e.peerDir {
+			continue
+		}
+		key := backend.Name + "|" + clientID + "|" + sessionID
+		if _, exists := sessionBatches[key]; !exists {
+			sessionOrder = append(sessionOrder, key)
+		}
+		sessionBatches[key] = append(sessionBatches[key], name)
+	}
+
 	workerCount := e.opts.MaxConcurrentDownloads
 	if workerCount < 1 {
 		workerCount = 1
 	}
-	if workerCount > len(segmentFiles) {
-		workerCount = len(segmentFiles)
+	if workerCount > len(sessionOrder) {
+		workerCount = len(sessionOrder)
 	}
 	if workerCount == 0 {
 		workerCount = 1
 	}
-	segmentJobs := make(chan string, workerCount)
+	segmentJobs := make(chan []string, workerCount)
 	var segmentWG sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		segmentWG.Add(1)
 		go func() {
 			defer segmentWG.Done()
-			for name := range segmentJobs {
-				e.processSegmentFile(ctx, backend, name)
+			for batch := range segmentJobs {
+				for _, name := range batch {
+					e.processSegmentFile(ctx, backend, name)
+				}
 			}
 		}()
 	}
-	for _, name := range segmentFiles {
-		segmentJobs <- name
+	for _, key := range sessionOrder {
+		segmentJobs <- sessionBatches[key]
 	}
 	close(segmentJobs)
 	segmentWG.Wait()
@@ -717,7 +733,6 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
-	e.markSeenRemote(backend.Name, name)
 	e.applyReceivedSegment(backend.Name, clientID, sessionID, name, session, env)
 	if env.Kind == KindOpen {
 		for _, pending := range e.takePreOpenSegments(backend.Name, clientID, sessionID) {
@@ -1204,6 +1219,7 @@ func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteNa
 		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, env.Seq, err)
 		return
 	}
+	e.markSeenRemote(backendName, remoteName)
 	if !advanced {
 		return
 	}

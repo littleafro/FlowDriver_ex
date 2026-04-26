@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -78,40 +78,27 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 	}
 	defer conn.Close()
 
+	virtual := transport.NewVirtualConn(session, nil)
 	errCh := make(chan error, 2)
 
 	go func() {
-		buf := make([]byte, 64*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				session.EnqueueTx(buf[:n])
-			}
-			if err != nil {
-				if err == io.EOF {
-					session.QueueClose()
-				}
-				errCh <- err
-				return
-			}
+		_, err := io.Copy(virtual, conn)
+		if err == nil {
+			err = io.EOF
 		}
+		_ = virtual.CloseWrite()
+		errCh <- err
 	}()
 
 	go func() {
-		for {
-			data, ok := <-session.RxChan
-			if !ok {
-				errCh <- fmt.Errorf("session closed by remote")
-				return
-			}
-			if len(data) == 0 {
-				continue
-			}
-			if _, err := conn.Write(data); err != nil {
-				errCh <- err
-				return
-			}
+		_, err := io.Copy(conn, virtual)
+		if err == nil {
+			err = io.EOF
 		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		errCh <- err
 	}()
 
 	<-errCh
