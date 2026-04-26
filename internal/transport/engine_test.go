@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -122,7 +121,7 @@ func TestFlushAllBatchesContiguousEnvelopesIntoSingleRemoteSegment(t *testing.T)
 	}
 }
 
-func TestStaleUnackedFilesAreNotDeleted(t *testing.T) {
+func TestUploadedMuxFileRemainsRemoteUntilReceiverDeletes(t *testing.T) {
 	t.Parallel()
 
 	engine, backend := newTestEngine(t, true)
@@ -148,59 +147,65 @@ func TestStaleUnackedFilesAreNotDeleted(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	if !backend.HasFile(seg.Meta.RemoteName) {
-		t.Fatalf("stale unacked file should not be deleted")
+		t.Fatalf("uploaded mux file should remain on backend until receiver cleanup")
 	}
-	if len(engine.pendingSnapshot()) != 1 {
-		t.Fatalf("stale unacked segment should remain pending")
+	if len(engine.pendingSnapshot()) != 0 {
+		t.Fatalf("uploaded mux file should be removed from local pending spool after successful upload")
 	}
 }
 
-func TestDeleteOnlyAfterAck(t *testing.T) {
+func TestProcessMuxFileDeletesRemoteObjectAfterDelivery(t *testing.T) {
 	t.Parallel()
 
-	engine, backend := newTestEngine(t, true)
+	engine, backend := newTestEngine(t, false)
 
-	session := NewSession("s1")
-	session.ClientID = "c1"
-	engine.AddSession(session)
-	session.EnqueueTx([]byte("hello"))
-	engine.flushAll(true, false)
-
-	seg := engine.pendingSnapshot()[0]
-	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
-	if !backend.HasFile(seg.Meta.RemoteName) {
-		t.Fatalf("expected uploaded segment on backend")
-	}
-
-	engine.deleteAckedSegments(context.Background())
-	time.Sleep(50 * time.Millisecond)
-	if !backend.HasFile(seg.Meta.RemoteName) {
-		t.Fatalf("segment deleted before ACK")
-	}
-
-	ack := AckState{
-		ClientID:      "c1",
+	openEnv := &Envelope{
 		SessionID:     "s1",
-		Direction:     DirReq,
-		AckedSeq:      seg.Meta.Seq,
-		UpdatedUnixMs: time.Now().UnixMilli(),
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "1.1.1.1:443",
+		Payload:       []byte("hello"),
+		CreatedUnixMs: time.Now().UnixMilli(),
 	}
-	payload, _ := json.Marshal(ack)
-	ackName := ackFilename(DirReq, "c1", "s1")
-	if err := backend.Put(context.Background(), ackName, bytes.NewReader(payload)); err != nil {
-		t.Fatalf("failed to store ack file: %v", err)
+	openEnv.EnsureChecksum()
+	dataEnv := &Envelope{
+		SessionID:     "s1",
+		Seq:           1,
+		Kind:          KindData,
+		Payload:       []byte("world"),
+		CreatedUnixMs: time.Now().UnixMilli(),
 	}
-	engine.processAckFile(context.Background(), engine.pool.Get("default"), ackName)
-	engine.deleteAckedSegments(context.Background())
+	dataEnv.EnsureChecksum()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !backend.HasFile(seg.Meta.RemoteName) && len(engine.pendingSnapshot()) == 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	payload, _, err := marshalSegmentPayloads([]*Envelope{openEnv, dataEnv}, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayloads failed: %v", err)
 	}
-	t.Fatalf("segment was not deleted after ACK")
+	name := muxFilename(DirReq, "c1", time.Now().Add(-time.Second).UnixNano())
+	if err := backend.Upload(context.Background(), name, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("backend upload failed: %v", err)
+	}
+
+	engine.processMuxFile(context.Background(), engine.pool.Get("default"), name)
+
+	if backend.HasFile(name) {
+		t.Fatalf("receiver should delete mux file after processing")
+	}
+	session := engine.GetSession("s1")
+	if session == nil {
+		t.Fatalf("expected session to be created")
+	}
+
+	got1 := <-session.RxChan
+	got2 := <-session.RxChan
+	if string(got1) != "hello" || string(got2) != "world" {
+		t.Fatalf("unexpected payload order %q %q", got1, got2)
+	}
+
+	engine.flushAckStates(context.Background())
+	if got := backend.PutCalls(ackFilename(DirReq, "c1", "s1")); got != 0 {
+		t.Fatalf("mux delivery should not upload ack files, got %d puts", got)
+	}
 }
 
 func TestRecoveredCleanAckDoesNotReupload(t *testing.T) {
@@ -547,6 +552,71 @@ func TestPollBackendProcessesSingleSessionInOrder(t *testing.T) {
 	}
 }
 
+func TestPollBackendProcessesMuxFilesPerClientInOrder(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	engine.opts.MaxConcurrentDownloads = 3
+	engine.opts.MaxOutOfOrderSegments = 1
+
+	sessionID := "ordered-mux"
+	makeMux := func(ts int64, env *Envelope) string {
+		env.EnsureChecksum()
+		payload, _, err := marshalSegmentPayloads([]*Envelope{env}, "off", 0)
+		if err != nil {
+			t.Fatalf("marshalSegmentPayloads seq=%d failed: %v", env.Seq, err)
+		}
+		name := muxFilename(DirReq, "c1", ts)
+		if err := backend.Upload(context.Background(), name, bytes.NewReader(payload)); err != nil {
+			t.Fatalf("backend upload seq=%d failed: %v", env.Seq, err)
+		}
+		return name
+	}
+
+	makeMux(1003, &Envelope{
+		SessionID:     sessionID,
+		Seq:           2,
+		Kind:          KindData,
+		Payload:       []byte("two"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	})
+	makeMux(1002, &Envelope{
+		SessionID:     sessionID,
+		Seq:           1,
+		Kind:          KindData,
+		Payload:       []byte("one"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	})
+	makeMux(1001, &Envelope{
+		SessionID:     sessionID,
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "1.1.1.1:443",
+		Payload:       []byte("zero"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	})
+	backend.SetReverseList(true)
+
+	engine.pollBackend(context.Background(), engine.pool.Get("default"))
+
+	session := engine.GetSession(sessionID)
+	if session == nil {
+		t.Fatalf("expected session to be created")
+	}
+
+	got0 := <-session.RxChan
+	got1 := <-session.RxChan
+	got2 := <-session.RxChan
+	if string(got0) != "zero" || string(got1) != "one" || string(got2) != "two" {
+		t.Fatalf("unexpected mux delivery order %q %q %q", got0, got1, got2)
+	}
+
+	engine.flushAckStates(context.Background())
+	if got := backend.PutCalls(ackFilename(DirReq, "c1", sessionID)); got != 0 {
+		t.Fatalf("mux poll should not upload ack files, got %d puts", got)
+	}
+}
+
 func TestDownloadNotFoundDebouncedBySeenCache(t *testing.T) {
 	t.Parallel()
 
@@ -615,40 +685,29 @@ func TestConfigureBackendListCutoff(t *testing.T) {
 	}
 }
 
-func TestDeleteDedupesInFlight(t *testing.T) {
+func TestCleanupRemoteStaleMuxFilesDeletesOnlyExpired(t *testing.T) {
 	t.Parallel()
 
 	engine, backend := newTestEngine(t, true)
-	backend.SetDeleteDelay(150 * time.Millisecond)
+	oldName := muxFilename(DirReq, "c1", time.Now().Add(-2*engine.remoteStaleFileTTL()).UnixNano())
+	freshName := muxFilename(DirReq, "c1", time.Now().Add(-engine.remoteStaleFileTTL()/4).UnixNano())
+	legacyName := segmentFilename(DirReq, "c1", "s1", 0)
 
-	session := NewSession("s-delete")
-	session.ClientID = "c1"
-	engine.AddSession(session)
-	session.EnqueueTx([]byte("hello"))
-	engine.flushAll(true, false)
-
-	segments := engine.pendingSnapshot()
-	if len(segments) != 1 {
-		t.Fatalf("expected 1 pending segment, got %d", len(segments))
-	}
-	seg := segments[0]
-	name := seg.Meta.RemoteName
-
-	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
-	if !seg.Meta.Uploaded {
-		t.Fatalf("segment should be uploaded before delete")
+	for _, name := range []string{oldName, freshName, legacyName} {
+		if err := backend.Upload(context.Background(), name, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatalf("backend upload failed for %s: %v", name, err)
+		}
 	}
 
-	engine.ackMu.Lock()
-	engine.remoteAcked[engine.remoteAckKey(seg.Meta.BackendName, seg.Meta.ClientID, seg.Meta.SessionID)] = seg.Meta.Seq
-	engine.ackMu.Unlock()
+	engine.cleanupRemoteStaleFiles(context.Background())
 
-	engine.deleteAckedSegments(context.Background())
-	time.Sleep(20 * time.Millisecond)
-	engine.deleteAckedSegments(context.Background())
-	time.Sleep(250 * time.Millisecond)
-
-	if got := backend.DeleteCalls(name); got != 1 {
-		t.Fatalf("expected single delete call for in-flight segment, got %d", got)
+	if backend.HasFile(oldName) {
+		t.Fatalf("expired mux file should be deleted")
+	}
+	if !backend.HasFile(freshName) {
+		t.Fatalf("fresh mux file should remain")
+	}
+	if !backend.HasFile(legacyName) {
+		t.Fatalf("legacy segment file should remain")
 	}
 }

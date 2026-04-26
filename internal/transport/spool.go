@@ -321,8 +321,32 @@ func segmentBatchFilename(dir Direction, clientID, sessionID string, startSeq, e
 	return fmt.Sprintf("%s-%s-%s-%020d-%020d.bin", dir, safeID(clientID), safeID(sessionID), startSeq, endSeq)
 }
 
+func muxFilename(dir Direction, clientID string, tsUnixNano int64) string {
+	return fmt.Sprintf("%s-%s-mux-%d.bin", dir, safeID(clientID), tsUnixNano)
+}
+
 func ackFilename(dir Direction, clientID, sessionID string) string {
 	return fmt.Sprintf("ack-%s-%s-%s.json", dir, safeID(clientID), safeID(sessionID))
+}
+
+func parseMuxFilename(name string) (Direction, string, int64, bool) {
+	if !strings.HasSuffix(name, ".bin") {
+		return "", "", 0, false
+	}
+	base := strings.TrimSuffix(name, ".bin")
+	parts := strings.Split(base, "-")
+	if len(parts) != 4 || parts[2] != "mux" {
+		return "", "", 0, false
+	}
+	clientID, err := unsafeID(parts[1])
+	if err != nil {
+		return "", "", 0, false
+	}
+	ts, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return "", "", 0, false
+	}
+	return Direction(parts[0]), clientID, ts, true
 }
 
 func parseSegmentFilename(name string) (Direction, string, string, uint64, uint64, bool) {

@@ -34,6 +34,7 @@ type metrics struct {
 type preOpenSegment struct {
 	remoteName string
 	envs       []*Envelope
+	needsAck   bool
 	bufferedAt time.Time
 }
 
@@ -80,8 +81,10 @@ type Engine struct {
 	ackPollMu   sync.Mutex
 	ackLastPoll map[string]time.Time
 
-	preOpenMu sync.Mutex
-	preOpen   map[string]map[uint64]*preOpenSegment
+	preOpenMu         sync.Mutex
+	preOpen           map[string]map[uint64]*preOpenSegment
+	remoteCleanupMu   sync.Mutex
+	lastRemoteCleanup time.Time
 
 	OnNewSession func(sessionID, targetAddr string, s *Session)
 }
@@ -155,6 +158,7 @@ func (e *Engine) Start(ctx context.Context) {
 	}
 	cutoffBackends := e.configureBackendListCutoff()
 	e.discardStartupBacklog(ctx, cutoffBackends)
+	e.cleanupRemoteStaleFiles(ctx)
 	e.deleteAckedSegments(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
@@ -286,12 +290,23 @@ func (e *Engine) flushLoop(ctx context.Context) {
 func (e *Engine) flushAll(force, allowHeartbeat bool) {
 	now := time.Now()
 
+	type preparedGroup struct {
+		backendName string
+		clientID    string
+		sessions    []*Session
+		prepared    [][]PreparedEnvelope
+		envs        []*Envelope
+	}
+
 	e.sessionMu.RLock()
 	sessions := make([]*Session, 0, len(e.sessions))
 	for _, s := range e.sessions {
 		sessions = append(sessions, s)
 	}
 	e.sessionMu.RUnlock()
+
+	groups := make(map[string]*preparedGroup)
+	groupOrder := make([]string, 0)
 
 	for _, s := range sessions {
 		if now.Sub(s.LastActivity()) >= e.opts.SessionIdleTimeout && !s.HasCloseQueued() {
@@ -306,74 +321,88 @@ func (e *Engine) flushAll(force, allowHeartbeat bool) {
 		}
 		s.BackendName = backend.Name
 
-		sessionKey := e.sessionScopedKey(backend.Name, s.ClientID, s.ID)
-		if e.pendingCountForSession(sessionKey) >= e.opts.MaxPendingSegmentsPerSession {
+		sendHeartbeat := allowHeartbeat && s.CanHeartbeat(now, e.opts.HeartbeatInterval)
+		prepared, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force, sendHeartbeat)
+		if err != nil {
+			log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
+			continue
+		}
+		if len(prepared) == 0 {
 			continue
 		}
 
-		for batchIndex := 0; ; batchIndex++ {
-			sendHeartbeat := allowHeartbeat && s.CanHeartbeat(now, e.opts.HeartbeatInterval)
-			prepared, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force || batchIndex > 0, sendHeartbeat)
-			if err != nil {
-				log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
-				break
+		clientID := s.ClientID
+		if clientID == "" {
+			clientID = e.id
+		}
+		groupKey := backend.Name + "|" + clientID
+		group := groups[groupKey]
+		if group == nil {
+			group = &preparedGroup{
+				backendName: backend.Name,
+				clientID:    clientID,
 			}
-			if len(prepared) == 0 {
-				break
-			}
+			groups[groupKey] = group
+			groupOrder = append(groupOrder, groupKey)
+		}
+		group.sessions = append(group.sessions, s)
+		group.prepared = append(group.prepared, prepared)
+		for _, item := range prepared {
+			group.envs = append(group.envs, item.Env)
+		}
+	}
 
-			clientID := s.ClientID
-			if clientID == "" {
-				clientID = e.id
-			}
+	for _, key := range groupOrder {
+		group := groups[key]
+		if group == nil || len(group.envs) == 0 {
+			continue
+		}
 
-			envs := make([]*Envelope, 0, len(prepared))
-			for _, item := range prepared {
-				envs = append(envs, item.Env)
-			}
+		payload, compression, err := marshalSegmentPayloads(group.envs, e.opts.Compression, e.opts.CompressionMinBytes)
+		if err != nil {
+			log.Printf("marshal mux payload failed backend=%s client=%s envs=%d: %v", group.backendName, group.clientID, len(group.envs), err)
+			continue
+		}
 
-			payload, compression, err := marshalSegmentPayloads(envs, e.opts.Compression, e.opts.CompressionMinBytes)
-			if err != nil {
-				log.Printf("marshal segment batch failed session=%s seq=%d end_seq=%d: %v", s.ID, envs[0].Seq, envs[len(envs)-1].Seq, err)
-				break
-			}
+		remoteName := muxFilename(e.myDir, group.clientID, time.Now().UnixNano())
+		meta := spoolSegmentMeta{
+			BackendName: group.backendName,
+			Direction:   e.myDir,
+			ClientID:    group.clientID,
+			SessionID:   "__mux__",
+			Seq:         0,
+			EndSeq:      uint64(len(group.envs) - 1),
+			RemoteName:  remoteName,
+			Compression: compression,
+		}
+		seg, err := e.spool.SaveSegment(meta, payload)
+		if err != nil {
+			log.Printf("spool save failed backend=%s client=%s envs=%d: %v", group.backendName, group.clientID, len(group.envs), err)
+			continue
+		}
 
-			meta := spoolSegmentMeta{
-				BackendName: backend.Name,
-				Direction:   e.myDir,
-				ClientID:    clientID,
-				SessionID:   s.ID,
-				Seq:         envs[0].Seq,
-				EndSeq:      envs[len(envs)-1].Seq,
-				RemoteName:  segmentBatchFilename(e.myDir, clientID, s.ID, envs[0].Seq, envs[len(envs)-1].Seq),
-				Compression: compression,
-			}
-			seg, err := e.spool.SaveSegment(meta, payload)
-			if err != nil {
-				log.Printf("spool save failed session=%s seq=%d end_seq=%d: %v", s.ID, envs[0].Seq, envs[len(envs)-1].Seq, err)
-				break
-			}
-			commitOK := true
-			for _, item := range prepared {
-				if err := s.CommitEnvelope(item.Env, item.Consumed); err != nil {
-					log.Printf("commit envelope failed session=%s seq=%d: %v", s.ID, item.Env.Seq, err)
+		commitOK := true
+		for i, session := range group.sessions {
+			for _, item := range group.prepared[i] {
+				if err := session.CommitEnvelope(item.Env, item.Consumed); err != nil {
+					log.Printf("commit envelope failed session=%s seq=%d: %v", session.ID, item.Env.Seq, err)
 					commitOK = false
 					break
 				}
 			}
 			if !commitOK {
-				_ = e.spool.DeleteSegment(seg)
 				break
 			}
-			e.addPending(seg)
-			if envs[0].Kind == KindOpen {
-				log.Printf("selected backend %s for session %s", backend.Name, s.ID)
-			}
-			if envs[len(envs)-1].Kind == KindClose {
-				break
-			}
-			if e.pendingCountForSession(sessionKey) >= e.opts.MaxPendingSegmentsPerSession {
-				break
+		}
+		if !commitOK {
+			_ = e.spool.DeleteSegment(seg)
+			continue
+		}
+
+		e.addPending(seg)
+		for _, env := range group.envs {
+			if env.Kind == KindOpen {
+				log.Printf("selected backend %s for session %s", group.backendName, env.SessionID)
 			}
 		}
 	}
@@ -470,6 +499,14 @@ func (e *Engine) uploadSegment(ctx context.Context, backend *storage.BackendHand
 	e.metrics.mu.Lock()
 	e.metrics.segmentsUploaded++
 	e.metrics.mu.Unlock()
+
+	if _, _, _, ok := parseMuxFilename(seg.Meta.RemoteName); ok {
+		if err := e.spool.DeleteSegment(seg); err != nil {
+			log.Printf("delete local spool failed %s: %v", seg.Meta.RemoteName, err)
+			return
+		}
+		e.removePending(seg)
+	}
 }
 
 func (e *Engine) ackLoop(ctx context.Context) {
@@ -568,9 +605,84 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 		return
 	}
 	segmentFiles = e.filterSeenRemote(backend.Name, segmentFiles)
+	muxFiles := make([]string, 0)
+	legacyFiles := make([]string, 0, len(segmentFiles))
+	for _, name := range segmentFiles {
+		if dir, _, _, ok := parseMuxFilename(name); ok && dir == e.peerDir {
+			muxFiles = append(muxFiles, name)
+			continue
+		}
+		legacyFiles = append(legacyFiles, name)
+	}
+
+	if len(muxFiles) > 0 {
+		clientBatches := make(map[string][]string)
+		clientOrder := make([]string, 0)
+		for _, name := range muxFiles {
+			_, clientID, _, ok := parseMuxFilename(name)
+			if !ok {
+				continue
+			}
+			key := backend.Name + "|" + clientID
+			if _, exists := clientBatches[key]; !exists {
+				clientOrder = append(clientOrder, key)
+			}
+			clientBatches[key] = append(clientBatches[key], name)
+		}
+
+		for key := range clientBatches {
+			sort.Strings(clientBatches[key])
+		}
+
+		muxWorkers := e.opts.MaxConcurrentDownloads
+		if muxWorkers < 1 {
+			muxWorkers = 1
+		}
+		if muxWorkers > len(clientOrder) {
+			muxWorkers = len(clientOrder)
+		}
+		if muxWorkers == 0 {
+			muxWorkers = 1
+		}
+		muxJobs := make(chan []string, muxWorkers)
+		var muxWG sync.WaitGroup
+		for i := 0; i < muxWorkers; i++ {
+			muxWG.Add(1)
+			go func() {
+				defer muxWG.Done()
+				for batch := range muxJobs {
+					for _, name := range batch {
+						e.processMuxFile(ctx, backend, name)
+					}
+				}
+			}()
+		}
+		for _, key := range clientOrder {
+			muxJobs <- clientBatches[key]
+		}
+		close(muxJobs)
+		muxWG.Wait()
+	}
+
+	if len(legacyFiles) == 0 {
+		if !e.shouldPollAcks(backend.Name) {
+			return
+		}
+
+		ackFiles, err := backend.Backend.ListQuery(ctx, ackPrefix)
+		if err != nil {
+			log.Printf("poll ack list error backend=%s prefix=%s: %v", backend.Name, ackPrefix, err)
+			return
+		}
+		for _, name := range ackFiles {
+			e.processAckFile(ctx, backend, name)
+		}
+		return
+	}
+
 	sessionBatches := make(map[string][]string)
 	sessionOrder := make([]string, 0)
-	for _, name := range segmentFiles {
+	for _, name := range legacyFiles {
 		dir, clientID, sessionID, _, _, ok := parseSegmentFilename(name)
 		if !ok || dir != e.peerDir {
 			continue
@@ -580,6 +692,9 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 			sessionOrder = append(sessionOrder, key)
 		}
 		sessionBatches[key] = append(sessionBatches[key], name)
+	}
+	for key := range sessionBatches {
+		sort.Strings(sessionBatches[key])
 	}
 
 	workerCount := e.opts.MaxConcurrentDownloads
@@ -735,7 +850,7 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		}
 	}
 	if session == nil && !locallyClosed && e.myDir == DirRes && startSeq > 0 {
-		if e.bufferPreOpenSegment(backend.Name, clientID, sessionID, name, envs) {
+		if e.bufferPreOpenSegment(backend.Name, clientID, sessionID, name, envs, true) {
 			e.markSeenRemote(backend.Name, name)
 			log.Printf("buffered pre-open segment backend=%s file=%s session=%s seq=%d end_seq=%d", backend.Name, name, sessionID, startSeq, endSeq)
 			return
@@ -752,11 +867,114 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
-	e.applyReceivedSegments(backend.Name, clientID, sessionID, name, session, envs)
+	e.applyReceivedSegments(backend.Name, clientID, sessionID, name, session, envs, true)
 	if firstEnv.Kind == KindOpen {
 		for _, pending := range e.takePreOpenSegments(backend.Name, clientID, sessionID) {
-			e.applyReceivedSegments(backend.Name, clientID, sessionID, pending.remoteName, session, pending.envs)
+			e.applyReceivedSegments(backend.Name, clientID, sessionID, pending.remoteName, session, pending.envs, pending.needsAck)
 		}
+	}
+}
+
+func (e *Engine) processMuxFile(ctx context.Context, backend *storage.BackendHandle, name string) {
+	dir, clientID, _, ok := parseMuxFilename(name)
+	if !ok || dir != e.peerDir {
+		return
+	}
+
+	e.ackMu.Lock()
+	seenAt := e.seenRemote[backend.Name+"|"+name]
+	e.ackMu.Unlock()
+	if !seenAt.IsZero() && time.Since(seenAt) < e.opts.StaleUnackedFileTTL {
+		return
+	}
+
+	select {
+	case e.downloadSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-e.downloadSem }()
+
+	rc, err := backend.Backend.Download(ctx, name)
+	if err != nil {
+		if storage.IsNotFoundError(err) {
+			e.markSeenRemote(backend.Name, name)
+			return
+		}
+		log.Printf("mux download error backend=%s file=%s: %v", backend.Name, name, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+	defer rc.Close()
+
+	payload, err := io.ReadAll(rc)
+	if err != nil {
+		log.Printf("mux read error backend=%s file=%s: %v", backend.Name, name, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+
+	envs, err := unmarshalSegmentPayloads(payload)
+	if err != nil {
+		log.Printf("mux decode error backend=%s file=%s: %v", backend.Name, name, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+
+	for _, env := range envs {
+		locallyClosed := e.isClosedSession(env.SessionID)
+		session := e.GetSession(env.SessionID)
+
+		if session == nil && !locallyClosed && e.myDir == DirRes && env.Kind == KindOpen {
+			if e.shouldDropStartupOpen(env.CreatedUnixMs) {
+				e.markSeenRemote(backend.Name, name)
+				e.markClosedSession(env.SessionID)
+				continue
+			}
+			if env.CreatedUnixMs > 0 && time.Since(time.UnixMilli(env.CreatedUnixMs)) > e.opts.StaleUnackedFileTTL {
+				e.markSeenRemote(backend.Name, name)
+				e.markClosedSession(env.SessionID)
+				continue
+			}
+			session = NewSession(env.SessionID)
+			session.ClientID = clientID
+			session.BackendName = backend.Name
+			session.TargetAddr = env.TargetAddr
+			e.AddSession(session)
+			if e.OnNewSession != nil {
+				go e.OnNewSession(env.SessionID, env.TargetAddr, session)
+			}
+		}
+
+		if session == nil && !locallyClosed && e.myDir == DirRes && env.Seq > 0 {
+			if e.bufferPreOpenSegment(backend.Name, clientID, env.SessionID, name, []*Envelope{env}, false) {
+				e.markSeenRemote(backend.Name, name)
+			}
+			continue
+		}
+
+		if session == nil {
+			continue
+		}
+
+		e.applyReceivedSegment(backend.Name, clientID, env.SessionID, name, session, env, false)
+		if env.Kind == KindOpen {
+			for _, pending := range e.takePreOpenSegments(backend.Name, clientID, env.SessionID) {
+				e.applyReceivedSegments(backend.Name, clientID, env.SessionID, pending.remoteName, session, pending.envs, pending.needsAck)
+			}
+		}
+	}
+
+	if err := backend.Backend.Delete(ctx, name); err != nil {
+		log.Printf("mux delete error backend=%s file=%s: %v", backend.Name, name, err)
+	} else {
+		log.Printf("cleanup action backend=%s deleted=%s", backend.Name, name)
 	}
 }
 
@@ -805,6 +1023,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			e.cleanupClosedSessions()
 			e.cleanupSeenRemote()
 			e.cleanupPreOpenSegments()
+			e.cleanupRemoteStaleFiles(ctx)
 			e.deleteAckedSegments(ctx)
 			e.cleanupSessions()
 			e.logMetrics()
@@ -1091,6 +1310,50 @@ func (e *Engine) warmRemoteDeleteCache(ctx context.Context, segmentBackends, ack
 	}
 }
 
+func (e *Engine) remoteStaleFileTTL() time.Duration {
+	return 30 * time.Second
+}
+
+func (e *Engine) cleanupRemoteStaleFiles(ctx context.Context) {
+	ttl := e.remoteStaleFileTTL()
+	now := time.Now()
+
+	e.remoteCleanupMu.Lock()
+	if !e.lastRemoteCleanup.IsZero() && now.Sub(e.lastRemoteCleanup) < ttl {
+		e.remoteCleanupMu.Unlock()
+		return
+	}
+	e.lastRemoteCleanup = now
+	e.remoteCleanupMu.Unlock()
+
+	prefix := string(e.myDir) + "-"
+	if e.myDir == DirReq {
+		prefix += safeID(e.id) + "-"
+	}
+
+	for _, backend := range e.pool.Backends() {
+		files, err := backend.Backend.ListQuery(ctx, prefix)
+		if err != nil {
+			log.Printf("remote stale cleanup list error backend=%s prefix=%s: %v", backend.Name, prefix, err)
+			continue
+		}
+		for _, name := range files {
+			_, _, ts, ok := parseMuxFilename(name)
+			if !ok {
+				continue
+			}
+			if now.Sub(time.Unix(0, ts)) <= ttl {
+				continue
+			}
+			if err := backend.Backend.Delete(ctx, name); err != nil {
+				log.Printf("remote stale cleanup delete error backend=%s file=%s: %v", backend.Name, name, err)
+				continue
+			}
+			log.Printf("startup/runtime stale cleanup backend=%s deleted=%s", backend.Name, name)
+		}
+	}
+}
+
 func (e *Engine) currentPollInterval() time.Duration {
 	e.sessionMu.RLock()
 	active := len(e.sessions)
@@ -1203,7 +1466,7 @@ func (e *Engine) noteAck(backendName, clientID, sessionID string, ackedSeq uint6
 	}
 }
 
-func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteName string, envs []*Envelope) bool {
+func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteName string, envs []*Envelope, needsAck bool) bool {
 	if len(envs) == 0 {
 		return true
 	}
@@ -1233,6 +1496,7 @@ func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteNa
 	bucket[envs[0].Seq] = &preOpenSegment{
 		remoteName: remoteName,
 		envs:       copies,
+		needsAck:   needsAck,
 		bufferedAt: time.Now(),
 	}
 	return true
@@ -1282,17 +1546,17 @@ func (e *Engine) cleanupPreOpenSegments() {
 	}
 }
 
-func (e *Engine) applyReceivedSegments(backendName, clientID, sessionID, remoteName string, session *Session, envs []*Envelope) {
+func (e *Engine) applyReceivedSegments(backendName, clientID, sessionID, remoteName string, session *Session, envs []*Envelope, needsAck bool) {
 	if len(envs) == 0 {
 		e.markSeenRemote(backendName, remoteName)
 		return
 	}
 	for _, env := range envs {
-		e.applyReceivedSegment(backendName, clientID, sessionID, remoteName, session, env)
+		e.applyReceivedSegment(backendName, clientID, sessionID, remoteName, session, env, needsAck)
 	}
 }
 
-func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteName string, session *Session, env *Envelope) {
+func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteName string, session *Session, env *Envelope, needsAck bool) {
 	ackedSeq, advanced, closedNow, err := session.ProcessRx(env)
 	if err != nil {
 		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, env.Seq, err)
@@ -1303,7 +1567,9 @@ func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteNa
 		return
 	}
 
-	e.noteAck(backendName, clientID, sessionID, ackedSeq)
+	if needsAck {
+		e.noteAck(backendName, clientID, sessionID, ackedSeq)
+	}
 	e.ackMu.Lock()
 	e.lastRx = time.Now()
 	e.ackMu.Unlock()
@@ -1417,6 +1683,10 @@ func (e *Engine) shouldLogOrphan(seq uint64) bool {
 }
 
 func (e *Engine) shouldPollAcks(backendName string) bool {
+	if !e.hasLegacyPendingSegments(backendName) {
+		return false
+	}
+
 	e.pendingMu.RLock()
 	hasPending := len(e.pending) > 0
 	e.pendingMu.RUnlock()
@@ -1438,6 +1708,22 @@ func (e *Engine) shouldPollAcks(backendName string) bool {
 	}
 	e.ackLastPoll[backendName] = now
 	return true
+}
+
+func (e *Engine) hasLegacyPendingSegments(backendName string) bool {
+	e.pendingMu.RLock()
+	defer e.pendingMu.RUnlock()
+
+	for _, seg := range e.pending {
+		if seg.Meta.BackendName != backendName {
+			continue
+		}
+		if _, _, _, ok := parseMuxFilename(seg.Meta.RemoteName); ok {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (e *Engine) shouldDropStartupOpen(createdUnixMs int64) bool {

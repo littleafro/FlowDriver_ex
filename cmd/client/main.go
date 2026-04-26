@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -15,14 +17,21 @@ import (
 	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/netutil"
-	covertsocks "github.com/NullLatency/flow-driver/internal/socks5"
 	"github.com/NullLatency/flow-driver/internal/transport"
+	"github.com/things-go/go-socks5"
+	"github.com/things-go/go-socks5/statute"
 )
 
 func generateSessionID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+type rawResolver struct{}
+
+func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	return ctx, nil, nil
 }
 
 func main() {
@@ -58,8 +67,8 @@ func main() {
 	}
 	rawPolicy := &netutil.DialPolicy{AllowedRawCIDRs: rawCIDRs}
 
-	server := &covertsocks.Server{
-		Dial: func(dc context.Context, network, addr string) (net.Conn, error) {
+	server := socks5.NewServer(
+		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
 			sessionID := generateSessionID()
 			session := transport.NewSession(sessionID)
 			session.ClientID = cid
@@ -84,8 +93,13 @@ func main() {
 
 			engine.AddSession(session)
 			return transport.NewVirtualConn(session, engine), nil
-		},
-	}
+		}),
+		socks5.WithAssociateHandle(func(ctx context.Context, w io.Writer, req *socks5.Request) error {
+			socks5.SendReply(w, statute.RepCommandNotSupported, nil)
+			return fmt.Errorf("covert UDP not supported")
+		}),
+		socks5.WithResolver(rawResolver{}),
+	)
 
 	listenAddr := appCfg.ListenAddr
 	if listenAddr == "" {
@@ -94,7 +108,7 @@ func main() {
 	log.Printf("listening for SOCKS5 on %s", listenAddr)
 
 	go func() {
-		if err := server.ListenAndServe(ctx, listenAddr); err != nil {
+		if err := server.ListenAndServe("tcp", listenAddr); err != nil {
 			log.Fatalf("SOCKS5 server failed: %v", err)
 		}
 	}()

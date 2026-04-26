@@ -5,9 +5,9 @@ import (
 	"flag"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,28 +79,35 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 	defer conn.Close()
 
 	virtual := transport.NewVirtualConn(session, nil)
-	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+		_ = virtual.Close()
+	}()
+
+	go func() {
+		defer wg.Done()
 		_, err := io.Copy(virtual, conn)
-		if err == nil {
-			err = io.EOF
+		if err != nil && err != io.EOF {
+			log.Printf("copy upstream->session error target=%s session=%s: %v", session.TargetAddr, session.ID, err)
 		}
 		_ = virtual.CloseWrite()
-		errCh <- err
 	}()
 
 	go func() {
+		defer wg.Done()
 		_, err := io.Copy(conn, virtual)
-		if err == nil {
-			err = io.EOF
+		if err != nil && err != io.EOF {
+			log.Printf("copy session->upstream error target=%s session=%s: %v", session.TargetAddr, session.ID, err)
 		}
-		if tcp, ok := conn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
 		}
-		errCh <- err
 	}()
 
-	<-errCh
+	wg.Wait()
 	session.QueueClose()
 }
