@@ -13,3 +13,6 @@ bin/
 go1.26/
 /client_config.json
 /server_config.json
+/client_logs.txt
+/server_logs.txt
+/curl_logs.txt

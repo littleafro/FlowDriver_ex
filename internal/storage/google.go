@@ -455,12 +455,11 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 }
 
 func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
-	fileID, err := b.fileIDForName(ctx, filename)
-	if err != nil {
-		return nil, err
-	}
-
 	return retryOperation(ctx, b.retryCfg, "download", false, func() (io.ReadCloser, error) {
+		fileID, err := b.fileIDForName(ctx, filename)
+		if err != nil {
+			return nil, err
+		}
 		tok, err := b.getValidToken(ctx)
 		if err != nil {
 			return nil, err
@@ -480,6 +479,9 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 		}
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusNotFound {
+				b.evictFileID(filename)
+			}
 			return nil, readHTTPError("download", resp)
 		}
 

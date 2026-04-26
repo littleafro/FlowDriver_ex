@@ -19,10 +19,11 @@ type fakeFile struct {
 type FakeBackend struct {
 	mu sync.Mutex
 
-	files   map[string][]fakeFile
-	puts    map[string]int
-	uploads map[string]int
-	deletes map[string]int
+	files     map[string][]fakeFile
+	puts      map[string]int
+	uploads   map[string]int
+	downloads map[string]int
+	deletes   map[string]int
 
 	uploadFailures   int
 	listFailures     int
@@ -39,6 +40,7 @@ func NewFakeBackend() *FakeBackend {
 		files:         make(map[string][]fakeFile),
 		puts:          make(map[string]int),
 		uploads:       make(map[string]int),
+		downloads:     make(map[string]int),
 		deletes:       make(map[string]int),
 		duplicateList: make(map[string]int),
 		quotaFailures: make(map[string]int),
@@ -125,6 +127,7 @@ func (b *FakeBackend) ListQuery(ctx context.Context, prefix string) ([]string, e
 func (b *FakeBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.downloads[filename]++
 	if err := b.fail("download"); err != nil {
 		return nil, err
 	}
@@ -211,6 +214,12 @@ func (b *FakeBackend) DeleteCalls(filename string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.deletes[filename]
+}
+
+func (b *FakeBackend) DownloadCalls(filename string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.downloads[filename]
 }
 
 func (b *FakeBackend) fail(op string) error {

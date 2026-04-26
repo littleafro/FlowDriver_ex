@@ -48,6 +48,7 @@ type Engine struct {
 
 	pendingMu        sync.RWMutex
 	pending          map[string]*spoolSegment
+	uploading        map[string]struct{}
 	recoveredNextSeq map[string]uint64
 
 	ackMu           sync.Mutex
@@ -84,6 +85,7 @@ func NewEngineWithPool(pool *storage.BackendPool, isClient bool, clientID string
 		closedSessions:   make(map[string]time.Time),
 		spool:            newSpoolStore(opts.DataDir),
 		pending:          make(map[string]*spoolSegment),
+		uploading:        make(map[string]struct{}),
 		recoveredNextSeq: make(map[string]uint64),
 		ackStates:        make(map[string]AckState),
 		ackLastUploaded:  make(map[string]time.Time),
@@ -135,6 +137,7 @@ func (e *Engine) Start(ctx context.Context) {
 	e.deleteAckedSegments(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
+	go e.deleteLoop(ctx)
 	go e.ackLoop(ctx)
 	go e.pollLoop(ctx)
 	go e.maintenanceLoop(ctx)
@@ -357,6 +360,19 @@ func (e *Engine) uploadLoop(ctx context.Context) {
 	}
 }
 
+func (e *Engine) deleteLoop(ctx context.Context) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.deleteAckedSegments(ctx)
+		}
+	}
+}
+
 func (e *Engine) triggerUploads(ctx context.Context) {
 	for _, seg := range e.pendingSnapshot() {
 		if seg.Meta.Abandoned {
@@ -372,17 +388,23 @@ func (e *Engine) triggerUploads(ctx context.Context) {
 		if backend == nil {
 			continue
 		}
+		uploadKey := e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
+		if !e.tryStartUpload(uploadKey) {
+			continue
+		}
 		select {
 		case e.uploadSem <- struct{}{}:
-			go e.uploadSegment(ctx, backend, seg)
+			go e.uploadSegment(ctx, backend, seg, uploadKey)
 		default:
+			e.finishUpload(uploadKey)
 			return
 		}
 	}
 }
 
-func (e *Engine) uploadSegment(ctx context.Context, backend *storage.BackendHandle, seg *spoolSegment) {
+func (e *Engine) uploadSegment(ctx context.Context, backend *storage.BackendHandle, seg *spoolSegment, uploadKey string) {
 	defer releaseSemaphore(e.uploadSem)
+	defer e.finishUpload(uploadKey)
 
 	data, err := seg.loadData()
 	if err != nil {
@@ -544,6 +566,30 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
+	session := e.GetSession(sessionID)
+	shouldAckWithoutDownload := false
+	switch {
+	case session == nil && e.myDir == DirReq:
+		// Client side never accepts peer-initiated sessions.
+		shouldAckWithoutDownload = true
+	case session == nil && seq > 0:
+		// If open(0) was never observed locally, higher seq segments are stale/orphaned.
+		shouldAckWithoutDownload = true
+	case session == nil && locallyClosed:
+		shouldAckWithoutDownload = true
+	}
+	if shouldAckWithoutDownload {
+		e.markSeenRemote(backend.Name, name)
+		e.noteAck(backend.Name, clientID, sessionID, seq)
+		if seq == 0 {
+			e.markClosedSession(sessionID)
+		}
+		if e.shouldLogOrphan(seq) {
+			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
+		}
+		return
+	}
+
 	select {
 	case e.downloadSem <- struct{}{}:
 	default:
@@ -553,6 +599,10 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 
 	rc, err := backend.Backend.Download(ctx, name)
 	if err != nil {
+		if storage.IsNotFoundError(err) {
+			e.markSeenRemote(backend.Name, name)
+			return
+		}
 		log.Printf("segment download error backend=%s file=%s: %v", backend.Name, name, err)
 		e.metrics.mu.Lock()
 		e.metrics.downloadErrors++
@@ -578,38 +628,47 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
-	session := e.GetSession(sessionID)
-	if session == nil && !locallyClosed && e.myDir == DirRes && env.Kind == KindOpen && e.OnNewSession != nil {
+	session = e.GetSession(sessionID)
+	if session == nil && !locallyClosed && e.myDir == DirRes && env.Kind == KindOpen {
+		if env.CreatedUnixMs > 0 && time.Since(time.UnixMilli(env.CreatedUnixMs)) > e.opts.StaleUnackedFileTTL {
+			e.markSeenRemote(backend.Name, name)
+			e.markClosedSession(sessionID)
+			e.noteAck(backend.Name, clientID, sessionID, seq)
+			log.Printf("discarded stale open segment backend=%s file=%s session=%s seq=%d age=%s", backend.Name, name, sessionID, seq, time.Since(time.UnixMilli(env.CreatedUnixMs)))
+			return
+		}
 		session = NewSession(sessionID)
 		session.ClientID = clientID
 		session.BackendName = backend.Name
 		session.TargetAddr = env.TargetAddr
 		e.AddSession(session)
-		go e.OnNewSession(sessionID, env.TargetAddr, session)
+		if e.OnNewSession != nil {
+			go e.OnNewSession(sessionID, env.TargetAddr, session)
+		}
 	}
 	if session == nil {
-		e.ackMu.Lock()
-		e.seenRemote[backend.Name+"|"+name] = time.Now()
-		e.lastRx = time.Now()
-		e.ackMu.Unlock()
+		e.markSeenRemote(backend.Name, name)
 		e.noteAck(backend.Name, clientID, sessionID, seq)
-		log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
+		if e.shouldLogOrphan(seq) {
+			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
+		}
 		return
 	}
 
-	ackedSeq, advanced, _, err := session.ProcessRx(env)
+	ackedSeq, advanced, closedNow, err := session.ProcessRx(env)
 	if err != nil {
 		log.Printf("process segment failed session=%s seq=%d: %v", sessionID, seq, err)
 		return
 	}
-	e.ackMu.Lock()
-	e.seenRemote[backend.Name+"|"+name] = time.Now()
-	e.ackMu.Unlock()
+	e.markSeenRemote(backend.Name, name)
 	if advanced {
 		e.noteAck(backend.Name, clientID, sessionID, ackedSeq)
 		e.ackMu.Lock()
 		e.lastRx = time.Now()
 		e.ackMu.Unlock()
+		if closedNow {
+			e.markClosedSession(sessionID)
+		}
 		e.metrics.mu.Lock()
 		e.metrics.segmentsDownloaded++
 		if e.peerDir == DirReq {
@@ -954,7 +1013,9 @@ func (e *Engine) addPending(seg *spoolSegment) {
 
 func (e *Engine) removePending(seg *spoolSegment) {
 	e.pendingMu.Lock()
-	delete(e.pending, e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
+	key := e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
+	delete(e.pending, key)
+	delete(e.uploading, key)
 	e.pendingMu.Unlock()
 }
 
@@ -1025,6 +1086,39 @@ func (e *Engine) isClosedSession(id string) bool {
 	defer e.closedSessionsMu.Unlock()
 	_, ok := e.closedSessions[id]
 	return ok
+}
+
+func (e *Engine) markClosedSession(id string) {
+	e.closedSessionsMu.Lock()
+	e.closedSessions[id] = time.Now()
+	e.closedSessionsMu.Unlock()
+}
+
+func (e *Engine) tryStartUpload(key string) bool {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if _, ok := e.uploading[key]; ok {
+		return false
+	}
+	e.uploading[key] = struct{}{}
+	return true
+}
+
+func (e *Engine) finishUpload(key string) {
+	e.pendingMu.Lock()
+	delete(e.uploading, key)
+	e.pendingMu.Unlock()
+}
+
+func (e *Engine) markSeenRemote(backendName, name string) {
+	e.ackMu.Lock()
+	e.seenRemote[backendName+"|"+name] = time.Now()
+	e.lastRx = time.Now()
+	e.ackMu.Unlock()
+}
+
+func (e *Engine) shouldLogOrphan(seq uint64) bool {
+	return seq == 0 || seq%32 == 0
 }
 
 func (e *Engine) pendingKey(backendName, remoteName string) string {

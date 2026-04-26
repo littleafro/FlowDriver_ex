@@ -58,8 +58,9 @@ func TestUploadedSegmentRetriedAfterUploadFailure(t *testing.T) {
 	}
 	seg := segments[0]
 	handle := engine.pool.Get("default")
+	uploadKey := engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
 
-	engine.uploadSegment(context.Background(), handle, seg)
+	engine.uploadSegment(context.Background(), handle, seg, uploadKey)
 	if seg.Meta.Uploaded {
 		t.Fatalf("segment should not be marked uploaded after failure")
 	}
@@ -76,7 +77,7 @@ func TestUploadedSegmentRetriedAfterUploadFailure(t *testing.T) {
 		t.Fatalf("payload lost after upload failure: %q", env.Payload)
 	}
 
-	engine.uploadSegment(context.Background(), handle, seg)
+	engine.uploadSegment(context.Background(), handle, seg, uploadKey)
 	if !seg.Meta.Uploaded {
 		t.Fatalf("segment should upload on retry")
 	}
@@ -94,7 +95,7 @@ func TestStaleUnackedFilesAreNotDeleted(t *testing.T) {
 	engine.flushAll(true, false)
 
 	seg := engine.pendingSnapshot()[0]
-	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg)
+	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
 	if !backend.HasFile(seg.Meta.RemoteName) {
 		t.Fatalf("expected uploaded segment on backend")
 	}
@@ -127,7 +128,7 @@ func TestDeleteOnlyAfterAck(t *testing.T) {
 	engine.flushAll(true, false)
 
 	seg := engine.pendingSnapshot()[0]
-	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg)
+	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
 	if !backend.HasFile(seg.Meta.RemoteName) {
 		t.Fatalf("expected uploaded segment on backend")
 	}
@@ -300,5 +301,122 @@ func TestResetRecoveredStateDoesNotReuploadDeadSegments(t *testing.T) {
 	}
 	if backend.UploadCalls(originalName) != 0 {
 		t.Fatalf("expected no remote upload retries after reset, got %d", backend.UploadCalls(originalName))
+	}
+}
+
+func TestTriggerUploadsDoesNotDuplicateInFlight(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	backend.SetVisibilityDelay(300 * time.Millisecond)
+
+	session := NewSession("s-upload")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("hello"))
+	engine.flushAll(true, false)
+
+	segments := engine.pendingSnapshot()
+	if len(segments) != 1 {
+		t.Fatalf("expected one pending segment, got %d", len(segments))
+	}
+	name := segments[0].Meta.RemoteName
+
+	for i := 0; i < 10; i++ {
+		engine.triggerUploads(context.Background())
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if got := backend.UploadCalls(name); got != 1 {
+		t.Fatalf("expected single upload attempt for in-flight segment, got %d", got)
+	}
+}
+
+func TestClientOrphanSeqSkipsDownload(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	env := &Envelope{
+		SessionID:     "orphan-client",
+		Seq:           7,
+		Kind:          KindData,
+		Payload:       []byte("orphan"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env.EnsureChecksum()
+	payload, compression, err := marshalSegmentPayload(env, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayload failed: %v", err)
+	}
+	meta := spoolSegmentMeta{
+		BackendName: "default",
+		Direction:   DirRes,
+		ClientID:    "c1",
+		SessionID:   env.SessionID,
+		Seq:         env.Seq,
+		RemoteName:  segmentFilename(DirRes, "c1", env.SessionID, env.Seq),
+		Compression: compression,
+	}
+	if err := backend.Upload(context.Background(), meta.RemoteName, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("backend upload failed: %v", err)
+	}
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), meta.RemoteName)
+	engine.flushAckStates(context.Background())
+
+	if got := backend.DownloadCalls(meta.RemoteName); got != 0 {
+		t.Fatalf("expected orphan seq>0 to be acked by metadata without download, got %d download calls", got)
+	}
+	ackName := ackFilename(DirRes, "c1", env.SessionID)
+	if backend.PutCalls(ackName) != 1 {
+		t.Fatalf("expected orphan metadata ack upload, got %d", backend.PutCalls(ackName))
+	}
+}
+
+func TestDownloadNotFoundDebouncedBySeenCache(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	name := segmentFilename(DirReq, "c1", "ghost", 0)
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), name)
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), name)
+
+	if got := backend.DownloadCalls(name); got != 1 {
+		t.Fatalf("expected only one download attempt for not-found segment, got %d", got)
+	}
+}
+
+func TestServerDropsStaleOpen(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, false)
+	sessionID := "stale-open"
+	env := &Envelope{
+		SessionID:     sessionID,
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "1.1.1.1:443",
+		CreatedUnixMs: time.Now().Add(-time.Second).UnixMilli(),
+	}
+	env.EnsureChecksum()
+	payload, _, err := marshalSegmentPayload(env, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalSegmentPayload failed: %v", err)
+	}
+	name := segmentFilename(DirReq, "c1", sessionID, 0)
+	if err := backend.Upload(context.Background(), name, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("backend upload failed: %v", err)
+	}
+
+	engine.processSegmentFile(context.Background(), engine.pool.Get("default"), name)
+	engine.flushAckStates(context.Background())
+
+	if s := engine.GetSession(sessionID); s != nil {
+		t.Fatalf("stale open should not create a session")
+	}
+	ackName := ackFilename(DirReq, "c1", sessionID)
+	if backend.PutCalls(ackName) != 1 {
+		t.Fatalf("stale open should be acked for cleanup, got %d ack uploads", backend.PutCalls(ackName))
 	}
 }

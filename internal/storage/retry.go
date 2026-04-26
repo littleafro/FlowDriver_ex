@@ -75,6 +75,18 @@ func isRetryableError(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded)
 }
 
+func IsNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusNotFound
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "no such file")
+}
+
 func isUnauthorizedError(err error) bool {
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) {
