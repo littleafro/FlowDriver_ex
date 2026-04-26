@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	segmentFileMagic = "FDQ1"
-	compressionOff   = byte(0)
-	compressionGzip  = byte(1)
+	segmentFileMagic  = "FDQ1"
+	segmentBatchMagic = "FDQ2"
+	compressionOff    = byte(0)
+	compressionGzip   = byte(1)
 )
 
 type AckState struct {
@@ -66,6 +68,7 @@ type spoolSegmentMeta struct {
 	ClientID         string    `json:"client_id"`
 	SessionID        string    `json:"session_id"`
 	Seq              uint64    `json:"seq"`
+	EndSeq           uint64    `json:"end_seq,omitempty"`
 	RemoteName       string    `json:"remote_name"`
 	Abandoned        bool      `json:"abandoned,omitempty"`
 	Uploaded         bool      `json:"uploaded"`
@@ -311,32 +314,52 @@ func segmentFilename(dir Direction, clientID, sessionID string, seq uint64) stri
 	return fmt.Sprintf("%s-%s-%s-%020d.bin", dir, safeID(clientID), safeID(sessionID), seq)
 }
 
+func segmentBatchFilename(dir Direction, clientID, sessionID string, startSeq, endSeq uint64) string {
+	if startSeq == endSeq {
+		return segmentFilename(dir, clientID, sessionID, startSeq)
+	}
+	return fmt.Sprintf("%s-%s-%s-%020d-%020d.bin", dir, safeID(clientID), safeID(sessionID), startSeq, endSeq)
+}
+
 func ackFilename(dir Direction, clientID, sessionID string) string {
 	return fmt.Sprintf("ack-%s-%s-%s.json", dir, safeID(clientID), safeID(sessionID))
 }
 
-func parseSegmentFilename(name string) (Direction, string, string, uint64, bool) {
+func parseSegmentFilename(name string) (Direction, string, string, uint64, uint64, bool) {
 	if !strings.HasSuffix(name, ".bin") {
-		return "", "", "", 0, false
+		return "", "", "", 0, 0, false
 	}
 	base := strings.TrimSuffix(name, ".bin")
 	parts := strings.Split(base, "-")
 	if len(parts) < 4 {
-		return "", "", "", 0, false
+		return "", "", "", 0, 0, false
 	}
-	seq, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
+
+	endSeqIdx := len(parts) - 1
+	startSeqIdx := endSeqIdx
+	startSeq, err := strconv.ParseUint(parts[startSeqIdx], 10, 64)
 	if err != nil {
-		return "", "", "", 0, false
+		return "", "", "", 0, 0, false
+	}
+	endSeq := startSeq
+	if len(parts) >= 5 {
+		if parsedStart, startErr := strconv.ParseUint(parts[endSeqIdx-1], 10, 64); startErr == nil {
+			if parsedEnd, endErr := strconv.ParseUint(parts[endSeqIdx], 10, 64); endErr == nil {
+				startSeq = parsedStart
+				endSeq = parsedEnd
+				startSeqIdx = endSeqIdx - 1
+			}
+		}
 	}
 	clientID, err := unsafeID(parts[1])
 	if err != nil {
-		return "", "", "", 0, false
+		return "", "", "", 0, 0, false
 	}
-	sessionID, err := unsafeID(strings.Join(parts[2:len(parts)-1], "-"))
+	sessionID, err := unsafeID(strings.Join(parts[2:startSeqIdx], "-"))
 	if err != nil {
-		return "", "", "", 0, false
+		return "", "", "", 0, 0, false
 	}
-	return Direction(parts[0]), clientID, sessionID, seq, true
+	return Direction(parts[0]), clientID, sessionID, startSeq, endSeq, true
 }
 
 func parseAckFilename(name string) (Direction, string, string, bool) {
@@ -360,9 +383,39 @@ func parseAckFilename(name string) (Direction, string, string, bool) {
 }
 
 func marshalSegmentPayload(env *Envelope, compression string, compressionMinBytes int) ([]byte, string, error) {
-	raw, err := env.MarshalBinary()
-	if err != nil {
-		return nil, "", err
+	return marshalSegmentPayloads([]*Envelope{env}, compression, compressionMinBytes)
+}
+
+func marshalSegmentPayloads(envs []*Envelope, compression string, compressionMinBytes int) ([]byte, string, error) {
+	if len(envs) == 0 {
+		return nil, "", fmt.Errorf("no envelopes to marshal")
+	}
+
+	magic := segmentFileMagic
+	var raw []byte
+	if len(envs) == 1 {
+		encoded, err := envs[0].MarshalBinary()
+		if err != nil {
+			return nil, "", err
+		}
+		raw = encoded
+	} else {
+		magic = segmentBatchMagic
+		var batch bytes.Buffer
+		var countBuf [2]byte
+		binary.BigEndian.PutUint16(countBuf[:], uint16(len(envs)))
+		batch.Write(countBuf[:])
+		for _, env := range envs {
+			encoded, err := env.MarshalBinary()
+			if err != nil {
+				return nil, "", err
+			}
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(encoded)))
+			batch.Write(lenBuf[:])
+			batch.Write(encoded)
+		}
+		raw = batch.Bytes()
 	}
 
 	applied := "off"
@@ -383,7 +436,7 @@ func marshalSegmentPayload(env *Envelope, compression string, compressionMinByte
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(segmentFileMagic)
+	buf.WriteString(magic)
 	switch applied {
 	case "off":
 		buf.WriteByte(compressionOff)
@@ -397,7 +450,23 @@ func marshalSegmentPayload(env *Envelope, compression string, compressionMinByte
 }
 
 func unmarshalSegmentPayload(payload []byte) (*Envelope, error) {
-	if len(payload) < len(segmentFileMagic)+1 || string(payload[:len(segmentFileMagic)]) != segmentFileMagic {
+	envs, err := unmarshalSegmentPayloads(payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(envs) != 1 {
+		return nil, fmt.Errorf("expected single envelope payload, got %d", len(envs))
+	}
+	return envs[0], nil
+}
+
+func unmarshalSegmentPayloads(payload []byte) ([]*Envelope, error) {
+	if len(payload) < len(segmentFileMagic)+1 {
+		return nil, fmt.Errorf("invalid segment payload header")
+	}
+
+	magic := string(payload[:len(segmentFileMagic)])
+	if magic != segmentFileMagic && magic != segmentBatchMagic {
 		return nil, fmt.Errorf("invalid segment payload header")
 	}
 	compression := payload[len(segmentFileMagic)]
@@ -419,11 +488,45 @@ func unmarshalSegmentPayload(payload []byte) (*Envelope, error) {
 		return nil, fmt.Errorf("unsupported compression flag: %d", compression)
 	}
 
-	env := &Envelope{}
-	if err := env.Decode(bytes.NewReader(body)); err != nil {
+	if magic == segmentFileMagic {
+		env := &Envelope{}
+		if err := env.Decode(bytes.NewReader(body)); err != nil {
+			return nil, err
+		}
+		return []*Envelope{env}, nil
+	}
+
+	reader := bytes.NewReader(body)
+	var countBuf [2]byte
+	if _, err := io.ReadFull(reader, countBuf[:]); err != nil {
 		return nil, err
 	}
-	return env, nil
+	count := int(binary.BigEndian.Uint16(countBuf[:]))
+	if count <= 0 {
+		return nil, fmt.Errorf("invalid envelope batch count: %d", count)
+	}
+
+	envs := make([]*Envelope, 0, count)
+	for i := 0; i < count; i++ {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
+			return nil, err
+		}
+		size := binary.BigEndian.Uint32(lenBuf[:])
+		if size == 0 || size > 32*1024*1024 {
+			return nil, fmt.Errorf("invalid envelope size: %d", size)
+		}
+		encoded := make([]byte, size)
+		if _, err := io.ReadFull(reader, encoded); err != nil {
+			return nil, err
+		}
+		env := &Envelope{}
+		if err := env.Decode(bytes.NewReader(encoded)); err != nil {
+			return nil, err
+		}
+		envs = append(envs, env)
+	}
+	return envs, nil
 }
 
 func safeID(v string) string {

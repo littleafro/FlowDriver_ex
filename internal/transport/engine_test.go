@@ -83,6 +83,45 @@ func TestUploadedSegmentRetriedAfterUploadFailure(t *testing.T) {
 	}
 }
 
+func TestFlushAllBatchesContiguousEnvelopesIntoSingleRemoteSegment(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+	engine.opts.SegmentBytes = 4
+	engine.opts.MaxSegmentBytes = 4
+	engine.opts.MaxMuxSegments = 8
+
+	session := NewSession("s-batch")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("abcdefghijkl"))
+
+	engine.flushAll(true, false)
+
+	segments := engine.pendingSnapshot()
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 batched pending segment, got %d", len(segments))
+	}
+	if segments[0].Meta.EndSeq <= segments[0].Meta.Seq {
+		t.Fatalf("expected batched segment to span multiple seqs, got start=%d end=%d", segments[0].Meta.Seq, segments[0].Meta.EndSeq)
+	}
+
+	data, err := segments[0].loadData()
+	if err != nil {
+		t.Fatalf("loadData failed: %v", err)
+	}
+	envs, err := unmarshalSegmentPayloads(data)
+	if err != nil {
+		t.Fatalf("unmarshalSegmentPayloads failed: %v", err)
+	}
+	if len(envs) < 2 {
+		t.Fatalf("expected multiple envelopes in batch, got %d", len(envs))
+	}
+	if envs[0].Kind != KindOpen {
+		t.Fatalf("expected first envelope to be open, got %s", envs[0].Kind)
+	}
+}
+
 func TestStaleUnackedFilesAreNotDeleted(t *testing.T) {
 	t.Parallel()
 

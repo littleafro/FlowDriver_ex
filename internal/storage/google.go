@@ -499,6 +499,19 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 }
 
 func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
+	b.fileIDsMu.RLock()
+	cachedID := b.fileIDs[filename]
+	b.fileIDsMu.RUnlock()
+	if cachedID != "" {
+		if err := b.deleteFileByID(ctx, filename, cachedID); err == nil {
+			b.evictFileID(filename)
+			b.setHealth(HealthHealthy)
+			return nil
+		} else if !IsNotFoundError(err) {
+			return err
+		}
+	}
+
 	files, err := b.lookupExactName(ctx, filename)
 	if err != nil {
 		return err
@@ -509,40 +522,46 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 	}
 
 	for _, f := range files {
-		fileID := f.ID
-		_, err := retryOperation(ctx, b.retryCfg, "delete", false, func() (struct{}, error) {
-			tok, err := b.getValidToken(ctx)
-			if err != nil {
-				return struct{}{}, err
-			}
-			if err := b.limit(ctx, "delete"); err != nil {
-				return struct{}{}, err
-			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
-			if err != nil {
-				return struct{}{}, err
-			}
-			req.Header.Set("Authorization", "Bearer "+tok)
-
-			resp, err := b.apiClient.Do(req)
-			if err != nil {
-				return struct{}{}, err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-				return struct{}{}, readHTTPError("delete", resp)
-			}
-			return struct{}{}, nil
-		}, func(attempt int, err error, delay time.Duration) {
-			b.onRetry("delete", attempt, err, delay)
-		})
-		if err != nil {
+		if err := b.deleteFileByID(ctx, filename, f.ID); err != nil {
 			return err
 		}
 	}
 
 	b.evictFileID(filename)
 	b.setHealth(HealthHealthy)
+	return nil
+}
+
+func (b *GoogleBackend) deleteFileByID(ctx context.Context, filename, fileID string) error {
+	_, err := retryOperation(ctx, b.retryCfg, "delete", false, func() (struct{}, error) {
+		tok, err := b.getValidToken(ctx)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if err := b.limit(ctx, "delete"); err != nil {
+			return struct{}{}, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
+		if err != nil {
+			return struct{}{}, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+
+		resp, err := b.apiClient.Do(req)
+		if err != nil {
+			return struct{}{}, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+			return struct{}{}, readHTTPError("delete", resp)
+		}
+		return struct{}{}, nil
+	}, func(attempt int, err error, delay time.Duration) {
+		b.onRetry("delete", attempt, err, delay)
+	})
+	if err != nil {
+		return err
+	}
 	return nil
 }
 

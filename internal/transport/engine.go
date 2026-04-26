@@ -33,7 +33,7 @@ type metrics struct {
 
 type preOpenSegment struct {
 	remoteName string
-	env        *Envelope
+	envs       []*Envelope
 	bufferedAt time.Time
 }
 
@@ -311,14 +311,14 @@ func (e *Engine) flushAll(force, allowHeartbeat bool) {
 			continue
 		}
 
-		for i := 0; i < e.opts.MaxMuxSegments; i++ {
+		for batchIndex := 0; ; batchIndex++ {
 			sendHeartbeat := allowHeartbeat && s.CanHeartbeat(now, e.opts.HeartbeatInterval)
-			env, consumed, err := s.PrepareEnvelope(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, force || i > 0, sendHeartbeat)
+			prepared, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force || batchIndex > 0, sendHeartbeat)
 			if err != nil {
-				log.Printf("prepare envelope failed session=%s: %v", s.ID, err)
+				log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
 				break
 			}
-			if env == nil {
+			if len(prepared) == 0 {
 				break
 			}
 
@@ -327,9 +327,14 @@ func (e *Engine) flushAll(force, allowHeartbeat bool) {
 				clientID = e.id
 			}
 
-			payload, compression, err := marshalSegmentPayload(env, e.opts.Compression, e.opts.CompressionMinBytes)
+			envs := make([]*Envelope, 0, len(prepared))
+			for _, item := range prepared {
+				envs = append(envs, item.Env)
+			}
+
+			payload, compression, err := marshalSegmentPayloads(envs, e.opts.Compression, e.opts.CompressionMinBytes)
 			if err != nil {
-				log.Printf("marshal segment failed session=%s seq=%d: %v", s.ID, env.Seq, err)
+				log.Printf("marshal segment batch failed session=%s seq=%d end_seq=%d: %v", s.ID, envs[0].Seq, envs[len(envs)-1].Seq, err)
 				break
 			}
 
@@ -338,25 +343,33 @@ func (e *Engine) flushAll(force, allowHeartbeat bool) {
 				Direction:   e.myDir,
 				ClientID:    clientID,
 				SessionID:   s.ID,
-				Seq:         env.Seq,
-				RemoteName:  segmentFilename(e.myDir, clientID, s.ID, env.Seq),
+				Seq:         envs[0].Seq,
+				EndSeq:      envs[len(envs)-1].Seq,
+				RemoteName:  segmentBatchFilename(e.myDir, clientID, s.ID, envs[0].Seq, envs[len(envs)-1].Seq),
 				Compression: compression,
 			}
 			seg, err := e.spool.SaveSegment(meta, payload)
 			if err != nil {
-				log.Printf("spool save failed session=%s seq=%d: %v", s.ID, env.Seq, err)
+				log.Printf("spool save failed session=%s seq=%d end_seq=%d: %v", s.ID, envs[0].Seq, envs[len(envs)-1].Seq, err)
 				break
 			}
-			if err := s.CommitEnvelope(env, consumed); err != nil {
-				log.Printf("commit envelope failed session=%s seq=%d: %v", s.ID, env.Seq, err)
+			commitOK := true
+			for _, item := range prepared {
+				if err := s.CommitEnvelope(item.Env, item.Consumed); err != nil {
+					log.Printf("commit envelope failed session=%s seq=%d: %v", s.ID, item.Env.Seq, err)
+					commitOK = false
+					break
+				}
+			}
+			if !commitOK {
 				_ = e.spool.DeleteSegment(seg)
 				break
 			}
 			e.addPending(seg)
-			if env.Kind == KindOpen {
+			if envs[0].Kind == KindOpen {
 				log.Printf("selected backend %s for session %s", backend.Name, s.ID)
 			}
-			if env.Kind == KindClose {
+			if envs[len(envs)-1].Kind == KindClose {
 				break
 			}
 			if e.pendingCountForSession(sessionKey) >= e.opts.MaxPendingSegmentsPerSession {
@@ -558,7 +571,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 	sessionBatches := make(map[string][]string)
 	sessionOrder := make([]string, 0)
 	for _, name := range segmentFiles {
-		dir, clientID, sessionID, _, ok := parseSegmentFilename(name)
+		dir, clientID, sessionID, _, _, ok := parseSegmentFilename(name)
 		if !ok || dir != e.peerDir {
 			continue
 		}
@@ -613,7 +626,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 }
 
 func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.BackendHandle, name string) {
-	dir, clientID, sessionID, seq, ok := parseSegmentFilename(name)
+	dir, clientID, sessionID, startSeq, endSeq, ok := parseSegmentFilename(name)
 	if !ok || dir != e.peerDir {
 		return
 	}
@@ -624,7 +637,7 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 	localAck, hasLocalAck := e.ackStates[localAckKey]
 	seenAt := e.seenRemote[backend.Name+"|"+name]
 	e.ackMu.Unlock()
-	if hasLocalAck && seq <= localAck.AckedSeq {
+	if hasLocalAck && endSeq <= localAck.AckedSeq {
 		return
 	}
 	if !seenAt.IsZero() && time.Since(seenAt) < e.opts.StaleUnackedFileTTL {
@@ -642,12 +655,12 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 	}
 	if shouldAckWithoutDownload {
 		e.markSeenRemote(backend.Name, name)
-		e.noteAck(backend.Name, clientID, sessionID, seq)
-		if seq == 0 {
+		e.noteAck(backend.Name, clientID, sessionID, endSeq)
+		if startSeq == 0 {
 			e.markClosedSession(sessionID)
 		}
-		if e.shouldLogOrphan(seq) {
-			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
+		if e.shouldLogOrphan(startSeq) {
+			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d end_seq=%d closed=%t", backend.Name, name, sessionID, startSeq, endSeq, locallyClosed)
 		}
 		return
 	}
@@ -681,7 +694,7 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		e.metrics.mu.Unlock()
 		return
 	}
-	env, err := unmarshalSegmentPayload(payload)
+	envs, err := unmarshalSegmentPayloads(payload)
 	if err != nil {
 		log.Printf("segment decode error backend=%s file=%s: %v", backend.Name, name, err)
 		e.metrics.mu.Lock()
@@ -690,53 +703,59 @@ func (e *Engine) processSegmentFile(ctx context.Context, backend *storage.Backen
 		return
 	}
 
+	if len(envs) == 0 {
+		e.markSeenRemote(backend.Name, name)
+		return
+	}
+
 	session = e.GetSession(sessionID)
-	if session == nil && !locallyClosed && e.myDir == DirRes && env.Kind == KindOpen {
-		if e.shouldDropStartupOpen(env.CreatedUnixMs) {
+	firstEnv := envs[0]
+	if session == nil && !locallyClosed && e.myDir == DirRes && firstEnv.Kind == KindOpen {
+		if e.shouldDropStartupOpen(firstEnv.CreatedUnixMs) {
 			e.markSeenRemote(backend.Name, name)
 			e.markClosedSession(sessionID)
-			e.noteAck(backend.Name, clientID, sessionID, seq)
-			log.Printf("discarded startup stale open backend=%s file=%s session=%s seq=%d created=%d started=%d", backend.Name, name, sessionID, seq, env.CreatedUnixMs, e.startedAtUnixMs)
+			e.noteAck(backend.Name, clientID, sessionID, endSeq)
+			log.Printf("discarded startup stale open backend=%s file=%s session=%s seq=%d end_seq=%d created=%d started=%d", backend.Name, name, sessionID, startSeq, endSeq, firstEnv.CreatedUnixMs, e.startedAtUnixMs)
 			return
 		}
-		if env.CreatedUnixMs > 0 && time.Since(time.UnixMilli(env.CreatedUnixMs)) > e.opts.StaleUnackedFileTTL {
+		if firstEnv.CreatedUnixMs > 0 && time.Since(time.UnixMilli(firstEnv.CreatedUnixMs)) > e.opts.StaleUnackedFileTTL {
 			e.markSeenRemote(backend.Name, name)
 			e.markClosedSession(sessionID)
-			e.noteAck(backend.Name, clientID, sessionID, seq)
-			log.Printf("discarded stale open segment backend=%s file=%s session=%s seq=%d age=%s", backend.Name, name, sessionID, seq, time.Since(time.UnixMilli(env.CreatedUnixMs)))
+			e.noteAck(backend.Name, clientID, sessionID, endSeq)
+			log.Printf("discarded stale open segment backend=%s file=%s session=%s seq=%d end_seq=%d age=%s", backend.Name, name, sessionID, startSeq, endSeq, time.Since(time.UnixMilli(firstEnv.CreatedUnixMs)))
 			return
 		}
 		session = NewSession(sessionID)
 		session.ClientID = clientID
 		session.BackendName = backend.Name
-		session.TargetAddr = env.TargetAddr
+		session.TargetAddr = firstEnv.TargetAddr
 		e.AddSession(session)
 		if e.OnNewSession != nil {
-			go e.OnNewSession(sessionID, env.TargetAddr, session)
+			go e.OnNewSession(sessionID, firstEnv.TargetAddr, session)
 		}
 	}
-	if session == nil && !locallyClosed && e.myDir == DirRes && seq > 0 {
-		if e.bufferPreOpenSegment(backend.Name, clientID, sessionID, name, env) {
+	if session == nil && !locallyClosed && e.myDir == DirRes && startSeq > 0 {
+		if e.bufferPreOpenSegment(backend.Name, clientID, sessionID, name, envs) {
 			e.markSeenRemote(backend.Name, name)
-			log.Printf("buffered pre-open segment backend=%s file=%s session=%s seq=%d", backend.Name, name, sessionID, seq)
+			log.Printf("buffered pre-open segment backend=%s file=%s session=%s seq=%d end_seq=%d", backend.Name, name, sessionID, startSeq, endSeq)
 			return
 		}
-		log.Printf("pre-open buffer full backend=%s file=%s session=%s seq=%d", backend.Name, name, sessionID, seq)
+		log.Printf("pre-open buffer full backend=%s file=%s session=%s seq=%d end_seq=%d", backend.Name, name, sessionID, startSeq, endSeq)
 		return
 	}
 	if session == nil {
 		e.markSeenRemote(backend.Name, name)
-		e.noteAck(backend.Name, clientID, sessionID, seq)
-		if e.shouldLogOrphan(seq) {
-			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d closed=%t", backend.Name, name, sessionID, seq, locallyClosed)
+		e.noteAck(backend.Name, clientID, sessionID, endSeq)
+		if e.shouldLogOrphan(startSeq) {
+			log.Printf("discarded orphan segment backend=%s file=%s session=%s seq=%d end_seq=%d closed=%t", backend.Name, name, sessionID, startSeq, endSeq, locallyClosed)
 		}
 		return
 	}
 
-	e.applyReceivedSegment(backend.Name, clientID, sessionID, name, session, env)
-	if env.Kind == KindOpen {
+	e.applyReceivedSegments(backend.Name, clientID, sessionID, name, session, envs)
+	if firstEnv.Kind == KindOpen {
 		for _, pending := range e.takePreOpenSegments(backend.Name, clientID, sessionID) {
-			e.applyReceivedSegment(backend.Name, clientID, sessionID, pending.remoteName, session, pending.env)
+			e.applyReceivedSegments(backend.Name, clientID, sessionID, pending.remoteName, session, pending.envs)
 		}
 	}
 }
@@ -948,7 +967,11 @@ func (e *Engine) recoverLocalState() error {
 	for _, seg := range segments {
 		e.addPending(seg)
 		key := e.sessionScopedKey(seg.Meta.BackendName, seg.Meta.ClientID, seg.Meta.SessionID)
-		if next := seg.Meta.Seq + 1; next > e.recoveredNextSeq[key] {
+		endSeq := seg.Meta.EndSeq
+		if endSeq < seg.Meta.Seq {
+			endSeq = seg.Meta.Seq
+		}
+		if next := endSeq + 1; next > e.recoveredNextSeq[key] {
 			e.recoveredNextSeq[key] = next
 		}
 	}
@@ -985,6 +1008,7 @@ func (e *Engine) resetRecoveredState(ctx context.Context) error {
 	}
 
 	abandonedUploads := 0
+	abandonedByBackend := make(map[string]struct{})
 	removedLocal := 0
 	for _, seg := range segments {
 		if seg.Meta.Uploaded && !seg.Meta.DeletedRemote {
@@ -995,6 +1019,7 @@ func (e *Engine) resetRecoveredState(ctx context.Context) error {
 			}
 			e.addPending(seg)
 			abandonedUploads++
+			abandonedByBackend[seg.Meta.BackendName] = struct{}{}
 			continue
 		}
 		if err := e.spool.DeleteSegment(seg); err != nil && !os.IsNotExist(err) {
@@ -1007,6 +1032,14 @@ func (e *Engine) resetRecoveredState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ackBackends := make(map[string]struct{})
+	for backendName, files := range acks {
+		if len(files) > 0 {
+			ackBackends[backendName] = struct{}{}
+		}
+	}
+	e.warmRemoteDeleteCache(ctx, abandonedByBackend, ackBackends)
+
 	removedAcks := 0
 	for backendName, files := range acks {
 		backend := e.pool.Get(backendName)
@@ -1027,6 +1060,35 @@ func (e *Engine) resetRecoveredState(ctx context.Context) error {
 		log.Printf("startup cleanup removed_local_segments=%d abandoned_uploaded_segments=%d removed_acks=%d", removedLocal, abandonedUploads, removedAcks)
 	}
 	return nil
+}
+
+func (e *Engine) warmRemoteDeleteCache(ctx context.Context, segmentBackends, ackBackends map[string]struct{}) {
+	segmentPrefix := string(e.myDir) + "-"
+	ackPrefix := "ack-" + string(e.myDir) + "-"
+	if e.myDir == DirReq {
+		idPrefix := safeID(e.id) + "-"
+		segmentPrefix += idPrefix
+		ackPrefix += idPrefix
+	}
+
+	for backendName := range segmentBackends {
+		backend := e.pool.Get(backendName)
+		if backend == nil {
+			continue
+		}
+		if _, err := backend.Backend.ListQuery(ctx, segmentPrefix); err != nil {
+			log.Printf("startup delete-cache warmup failed backend=%s prefix=%s: %v", backendName, segmentPrefix, err)
+		}
+	}
+	for backendName := range ackBackends {
+		backend := e.pool.Get(backendName)
+		if backend == nil {
+			continue
+		}
+		if _, err := backend.Backend.ListQuery(ctx, ackPrefix); err != nil {
+			log.Printf("startup ack-cache warmup failed backend=%s prefix=%s: %v", backendName, ackPrefix, err)
+		}
+	}
 }
 
 func (e *Engine) currentPollInterval() time.Duration {
@@ -1141,7 +1203,10 @@ func (e *Engine) noteAck(backendName, clientID, sessionID string, ackedSeq uint6
 	}
 }
 
-func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteName string, env *Envelope) bool {
+func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteName string, envs []*Envelope) bool {
+	if len(envs) == 0 {
+		return true
+	}
 	key := e.sessionScopedKey(backendName, clientID, sessionID)
 
 	e.preOpenMu.Lock()
@@ -1152,18 +1217,22 @@ func (e *Engine) bufferPreOpenSegment(backendName, clientID, sessionID, remoteNa
 		bucket = make(map[uint64]*preOpenSegment)
 		e.preOpen[key] = bucket
 	}
-	if _, exists := bucket[env.Seq]; exists {
+	if _, exists := bucket[envs[0].Seq]; exists {
 		return true
 	}
 	if len(bucket) >= e.opts.MaxOutOfOrderSegments {
 		return false
 	}
 
-	copyEnv := *env
-	copyEnv.Payload = append([]byte(nil), env.Payload...)
-	bucket[env.Seq] = &preOpenSegment{
+	copies := make([]*Envelope, 0, len(envs))
+	for _, env := range envs {
+		copyEnv := *env
+		copyEnv.Payload = append([]byte(nil), env.Payload...)
+		copies = append(copies, &copyEnv)
+	}
+	bucket[envs[0].Seq] = &preOpenSegment{
 		remoteName: remoteName,
-		env:        &copyEnv,
+		envs:       copies,
 		bufferedAt: time.Now(),
 	}
 	return true
@@ -1186,7 +1255,7 @@ func (e *Engine) takePreOpenSegments(backendName, clientID, sessionID string) []
 		out = append(out, seg)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].env.Seq < out[j].env.Seq
+		return out[i].envs[0].Seq < out[j].envs[0].Seq
 	})
 	return out
 }
@@ -1210,6 +1279,16 @@ func (e *Engine) cleanupPreOpenSegments() {
 		if len(bucket) == 0 {
 			delete(e.preOpen, key)
 		}
+	}
+}
+
+func (e *Engine) applyReceivedSegments(backendName, clientID, sessionID, remoteName string, session *Session, envs []*Envelope) {
+	if len(envs) == 0 {
+		e.markSeenRemote(backendName, remoteName)
+		return
+	}
+	for _, env := range envs {
+		e.applyReceivedSegment(backendName, clientID, sessionID, remoteName, session, env)
 	}
 }
 
@@ -1247,7 +1326,11 @@ func (e *Engine) isAcked(seg *spoolSegment) bool {
 	e.ackMu.Lock()
 	defer e.ackMu.Unlock()
 	ackedSeq, ok := e.remoteAcked[key]
-	return ok && seg.Meta.Seq <= ackedSeq
+	endSeq := seg.Meta.EndSeq
+	if endSeq < seg.Meta.Seq {
+		endSeq = seg.Meta.Seq
+	}
+	return ok && endSeq <= ackedSeq
 }
 
 func (e *Engine) isClosedSession(id string) bool {
@@ -1413,7 +1496,7 @@ func (e *Engine) discardStartupBacklog(ctx context.Context, cutoffConfigured map
 		sessions := make(map[string]struct{})
 		segmentCount := 0
 		for _, name := range files {
-			dir, clientID, sessionID, _, ok := parseSegmentFilename(name)
+			dir, clientID, sessionID, _, _, ok := parseSegmentFilename(name)
 			if !ok || dir != e.peerDir {
 				continue
 			}

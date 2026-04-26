@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+type PreparedEnvelope struct {
+	Env      *Envelope
+	Consumed int
+}
+
 type Session struct {
 	ID string
 
@@ -112,18 +117,65 @@ func (s *Session) PrepareEnvelope(now time.Time, segmentBytes, maxSegmentBytes i
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	prepared, err := s.prepareEnvelopeLocked(now, segmentBytes, maxSegmentBytes, force, allowHeartbeat, 0, s.txSeq, s.openSent)
+	if err != nil || prepared == nil {
+		return nil, 0, err
+	}
+	return prepared.Env, prepared.Consumed, nil
+}
+
+func (s *Session) PrepareEnvelopeBatch(now time.Time, segmentBytes, maxSegmentBytes, maxMuxSegments int, force, allowHeartbeat bool) ([]PreparedEnvelope, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if maxMuxSegments <= 0 {
+		maxMuxSegments = 1
+	}
 	if s.closeSent || s.rxClosed {
-		return nil, 0, nil
+		return nil, nil
 	}
 
-	shouldSendOpen := !s.openSent
-	shouldHeartbeat := allowHeartbeat && !s.closeQueued && len(s.txBuf) == 0 && now.Sub(s.lastHeartbeatTx) > 0
+	offset := 0
+	nextSeq := s.txSeq
+	openSent := s.openSent
+	out := make([]PreparedEnvelope, 0, maxMuxSegments)
 
-	if !shouldSendOpen && !force && len(s.txBuf) < segmentBytes && !s.closeQueued && !shouldHeartbeat {
-		return nil, 0, nil
+	for i := 0; i < maxMuxSegments; i++ {
+		prepared, err := s.prepareEnvelopeLocked(now, segmentBytes, maxSegmentBytes, force || i > 0, allowHeartbeat, offset, nextSeq, openSent)
+		if err != nil {
+			return nil, err
+		}
+		if prepared == nil {
+			break
+		}
+		out = append(out, *prepared)
+		offset += prepared.Consumed
+		nextSeq++
+		openSent = openSent || prepared.Env.Kind == KindOpen
+		if prepared.Env.Kind == KindClose || prepared.Env.Kind == KindHeartbeat {
+			break
+		}
 	}
-	if !shouldSendOpen && len(s.txBuf) == 0 && !s.closeQueued && !shouldHeartbeat {
-		return nil, 0, nil
+	return out, nil
+}
+
+func (s *Session) prepareEnvelopeLocked(now time.Time, segmentBytes, maxSegmentBytes int, force, allowHeartbeat bool, txOffset int, seq uint64, openSent bool) (*PreparedEnvelope, error) {
+	if s.closeSent || s.rxClosed {
+		return nil, nil
+	}
+
+	buffered := len(s.txBuf) - txOffset
+	if buffered < 0 {
+		buffered = 0
+	}
+	shouldSendOpen := !openSent
+	shouldHeartbeat := allowHeartbeat && !s.closeQueued && buffered == 0 && now.Sub(s.lastHeartbeatTx) > 0
+
+	if !shouldSendOpen && !force && buffered < segmentBytes && !s.closeQueued && !shouldHeartbeat {
+		return nil, nil
+	}
+	if !shouldSendOpen && buffered == 0 && !s.closeQueued && !shouldHeartbeat {
+		return nil, nil
 	}
 
 	kind := KindData
@@ -133,7 +185,7 @@ func (s *Session) PrepareEnvelope(now time.Time, segmentBytes, maxSegmentBytes i
 		kind = KindHeartbeat
 	}
 
-	payloadLen := len(s.txBuf)
+	payloadLen := buffered
 	if payloadLen > maxSegmentBytes {
 		payloadLen = maxSegmentBytes
 	}
@@ -141,29 +193,32 @@ func (s *Session) PrepareEnvelope(now time.Time, segmentBytes, maxSegmentBytes i
 		kind = KindClose
 	}
 	if kind == KindClose {
-		payloadLen = len(s.txBuf)
+		payloadLen = buffered
 		if payloadLen > maxSegmentBytes {
 			payloadLen = maxSegmentBytes
 			kind = KindData
 		}
 	}
-	if kind == KindData && s.closeQueued && payloadLen == len(s.txBuf) {
+	if kind == KindData && s.closeQueued && payloadLen == buffered {
 		kind = KindClose
 	}
 
 	payload := make([]byte, payloadLen)
-	copy(payload, s.txBuf[:payloadLen])
+	copy(payload, s.txBuf[txOffset:txOffset+payloadLen])
 
 	env := &Envelope{
 		SessionID:     s.ID,
-		Seq:           s.txSeq,
+		Seq:           seq,
 		Kind:          kind,
 		TargetAddr:    s.TargetAddr,
 		Payload:       payload,
 		CreatedUnixMs: now.UnixMilli(),
 	}
 	env.EnsureChecksum()
-	return env, payloadLen, nil
+	return &PreparedEnvelope{
+		Env:      env,
+		Consumed: payloadLen,
+	}, nil
 }
 
 func (s *Session) CommitEnvelope(env *Envelope, consumed int) error {
