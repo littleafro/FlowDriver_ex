@@ -326,20 +326,7 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		return err
 	}
 
-	if existing, err := b.lookupExactName(ctx, filename); err == nil && len(existing) > 0 {
-		return nil
-	}
-
 	_, err = retryOperation(ctx, b.retryCfg, "upload", b.retryCfg.RetryForeverForPendingUploads, func() (struct{}, error) {
-		existing, err := b.lookupExactName(ctx, filename)
-		if err == nil && len(existing) > 0 {
-			b.cacheFileID(filename, existing[0].ID)
-			return struct{}{}, nil
-		}
-		if err != nil && !isRetryableError(err) {
-			return struct{}{}, err
-		}
-
 		tok, err := b.getValidToken(ctx)
 		if err != nil {
 			return struct{}{}, err

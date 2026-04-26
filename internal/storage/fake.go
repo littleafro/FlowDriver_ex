@@ -14,6 +14,7 @@ import (
 type fakeFile struct {
 	data      []byte
 	visibleAt time.Time
+	createdAt time.Time
 }
 
 type FakeBackend struct {
@@ -30,9 +31,11 @@ type FakeBackend struct {
 	downloadFailures int
 	deleteFailures   int
 	visibilityDelay  time.Duration
+	deleteDelay      time.Duration
 	duplicateList    map[string]int
 	reverseList      bool
 	quotaFailures    map[string]int
+	listAfterMs      int64
 }
 
 func NewFakeBackend() *FakeBackend {
@@ -70,6 +73,7 @@ func (b *FakeBackend) Upload(ctx context.Context, filename string, data io.Reade
 	b.files[filename] = append(b.files[filename], fakeFile{
 		data:      payload,
 		visibleAt: time.Now().Add(b.visibilityDelay),
+		createdAt: time.Now(),
 	})
 	return nil
 }
@@ -88,6 +92,7 @@ func (b *FakeBackend) Put(ctx context.Context, filename string, data io.Reader) 
 	b.files[filename] = []fakeFile{{
 		data:      payload,
 		visibleAt: time.Now().Add(b.visibilityDelay),
+		createdAt: time.Now(),
 	}}
 	return nil
 }
@@ -100,12 +105,16 @@ func (b *FakeBackend) ListQuery(ctx context.Context, prefix string) ([]string, e
 	}
 	now := time.Now()
 	var names []string
+	listAfter := b.listAfterMs
 	for name, entries := range b.files {
 		if prefix != "" && !strings.HasPrefix(name, prefix) {
 			continue
 		}
 		for _, entry := range entries {
 			if now.Before(entry.visibleAt) {
+				continue
+			}
+			if listAfter > 0 && entry.createdAt.UnixMilli() <= listAfter {
 				continue
 			}
 			names = append(names, name)
@@ -146,6 +155,13 @@ func (b *FakeBackend) Download(ctx context.Context, filename string) (io.ReadClo
 
 func (b *FakeBackend) Delete(ctx context.Context, filename string) error {
 	b.mu.Lock()
+	delay := b.deleteDelay
+	b.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
+	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.fail("delete"); err != nil {
 		return err
@@ -173,6 +189,12 @@ func (b *FakeBackend) SetVisibilityDelay(d time.Duration) {
 	b.mu.Unlock()
 }
 
+func (b *FakeBackend) SetDeleteDelay(d time.Duration) {
+	b.mu.Lock()
+	b.deleteDelay = d
+	b.mu.Unlock()
+}
+
 func (b *FakeBackend) SetDuplicateListing(filename string, duplicates int) {
 	b.mu.Lock()
 	b.duplicateList[filename] = duplicates
@@ -183,6 +205,18 @@ func (b *FakeBackend) SetReverseList(reverse bool) {
 	b.mu.Lock()
 	b.reverseList = reverse
 	b.mu.Unlock()
+}
+
+func (b *FakeBackend) SetListCreatedAfter(unixMs int64) {
+	b.mu.Lock()
+	b.listAfterMs = unixMs
+	b.mu.Unlock()
+}
+
+func (b *FakeBackend) ListCreatedAfter() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.listAfterMs
 }
 
 func (b *FakeBackend) SetQuotaFailures(op string, count int) {

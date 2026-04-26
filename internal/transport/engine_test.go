@@ -420,3 +420,61 @@ func TestServerDropsStaleOpen(t *testing.T) {
 		t.Fatalf("stale open should be acked for cleanup, got %d ack uploads", backend.PutCalls(ackName))
 	}
 }
+
+func TestConfigureBackendListCutoff(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	engine.startedAtUnixMs = time.Now().UnixMilli()
+
+	configured := engine.configureBackendListCutoff()
+	if _, ok := configured["default"]; !ok {
+		t.Fatalf("expected cutoff to be configured for default backend")
+	}
+
+	got := backend.ListCreatedAfter()
+	if got <= 0 {
+		t.Fatalf("expected positive list cutoff, got %d", got)
+	}
+	if got > engine.startedAtUnixMs {
+		t.Fatalf("cutoff must not be after startup time: cutoff=%d startup=%d", got, engine.startedAtUnixMs)
+	}
+}
+
+func TestDeleteDedupesInFlight(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	backend.SetDeleteDelay(150 * time.Millisecond)
+
+	session := NewSession("s-delete")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("hello"))
+	engine.flushAll(true, false)
+
+	segments := engine.pendingSnapshot()
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 pending segment, got %d", len(segments))
+	}
+	seg := segments[0]
+	name := seg.Meta.RemoteName
+
+	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName))
+	if !seg.Meta.Uploaded {
+		t.Fatalf("segment should be uploaded before delete")
+	}
+
+	engine.ackMu.Lock()
+	engine.remoteAcked[engine.remoteAckKey(seg.Meta.BackendName, seg.Meta.ClientID, seg.Meta.SessionID)] = seg.Meta.Seq
+	engine.ackMu.Unlock()
+
+	engine.deleteAckedSegments(context.Background())
+	time.Sleep(20 * time.Millisecond)
+	engine.deleteAckedSegments(context.Background())
+	time.Sleep(250 * time.Millisecond)
+
+	if got := backend.DeleteCalls(name); got != 1 {
+		t.Fatalf("expected single delete call for in-flight segment, got %d", got)
+	}
+}

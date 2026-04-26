@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -29,6 +30,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Resolve release tag
         id: meta
@@ -41,18 +45,26 @@ jobs:
           fi
 
           if [ -z "$TAG" ]; then
-            echo "workflow_dispatch requires release_tag when not running from a tag ref" >&2
-            exit 1
+            TAG="$(git tag --points-at "$GITHUB_SHA" | grep -E '^v' | head -n1 || true)"
           fi
 
+          if [ -z "$TAG" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No v* tag found for commit $GITHUB_SHA. Push the tag ref too (e.g. git push origin vX.Y.Z or git push --follow-tags)." >&2
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.25'
 
       - name: Build Binaries
+        if: steps.meta.outputs.skip != 'true'
         shell: bash
         run: |
           VERSION="${{ steps.meta.outputs.tag }}"
@@ -74,6 +86,7 @@ jobs:
           zip -r "${FOLDER_NAME}.zip" $FOLDER_NAME
 
       - name: Release
+        if: steps.meta.outputs.skip != 'true'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.meta.outputs.tag }}

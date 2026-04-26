@@ -49,6 +49,7 @@ type Engine struct {
 	pendingMu        sync.RWMutex
 	pending          map[string]*spoolSegment
 	uploading        map[string]struct{}
+	deleting         map[string]struct{}
 	recoveredNextSeq map[string]uint64
 
 	ackMu           sync.Mutex
@@ -68,6 +69,7 @@ type Engine struct {
 
 	metrics         metrics
 	startedAtUnixMs int64
+	startupCutoffMs int64
 
 	ackPollMu   sync.Mutex
 	ackLastPoll map[string]time.Time
@@ -90,6 +92,7 @@ func NewEngineWithPool(pool *storage.BackendPool, isClient bool, clientID string
 		spool:            newSpoolStore(opts.DataDir),
 		pending:          make(map[string]*spoolSegment),
 		uploading:        make(map[string]struct{}),
+		deleting:         make(map[string]struct{}),
 		recoveredNextSeq: make(map[string]uint64),
 		ackStates:        make(map[string]AckState),
 		ackLastUploaded:  make(map[string]time.Time),
@@ -140,8 +143,8 @@ func (e *Engine) Start(ctx context.Context) {
 	if err := e.resetRecoveredState(ctx); err != nil {
 		log.Printf("reset recovered state failed: %v", err)
 	}
-	e.applyBackendListCutoff()
-	e.discardStartupBacklog(ctx)
+	cutoffBackends := e.configureBackendListCutoff()
+	e.discardStartupBacklog(ctx, cutoffBackends)
 	e.deleteAckedSegments(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
@@ -541,6 +544,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 		log.Printf("poll segment list error backend=%s prefix=%s: %v", backend.Name, segmentPrefix, err)
 		return
 	}
+	segmentFiles = e.filterSeenRemote(backend.Name, segmentFiles)
 	workerCount := e.opts.MaxConcurrentDownloads
 	if workerCount < 1 {
 		workerCount = 1
@@ -830,17 +834,23 @@ func (e *Engine) deleteAckedSegments(ctx context.Context) {
 		if backend == nil {
 			continue
 		}
+		deleteKey := e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
+		if !e.tryStartDelete(deleteKey) {
+			continue
+		}
 		select {
 		case e.deleteSem <- struct{}{}:
-			go e.deleteSegment(ctx, backend, seg)
+			go e.deleteSegment(ctx, backend, seg, deleteKey)
 		default:
+			e.finishDelete(deleteKey)
 			return
 		}
 	}
 }
 
-func (e *Engine) deleteSegment(ctx context.Context, backend *storage.BackendHandle, seg *spoolSegment) {
+func (e *Engine) deleteSegment(ctx context.Context, backend *storage.BackendHandle, seg *spoolSegment, deleteKey string) {
 	defer releaseSemaphore(e.deleteSem)
+	defer e.finishDelete(deleteKey)
 	if err := backend.Backend.Delete(ctx, seg.Meta.RemoteName); err != nil {
 		seg.Meta.DeleteAttempts++
 		seg.Meta.NextDeleteUnixMs = time.Now().Add(time.Second).UnixMilli()
@@ -1058,6 +1068,7 @@ func (e *Engine) removePending(seg *spoolSegment) {
 	key := e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
 	delete(e.pending, key)
 	delete(e.uploading, key)
+	delete(e.deleting, key)
 	e.pendingMu.Unlock()
 }
 
@@ -1152,11 +1163,54 @@ func (e *Engine) finishUpload(key string) {
 	e.pendingMu.Unlock()
 }
 
+func (e *Engine) tryStartDelete(key string) bool {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if _, ok := e.deleting[key]; ok {
+		return false
+	}
+	e.deleting[key] = struct{}{}
+	return true
+}
+
+func (e *Engine) finishDelete(key string) {
+	e.pendingMu.Lock()
+	delete(e.deleting, key)
+	e.pendingMu.Unlock()
+}
+
 func (e *Engine) markSeenRemote(backendName, name string) {
 	e.ackMu.Lock()
 	e.seenRemote[backendName+"|"+name] = time.Now()
 	e.lastRx = time.Now()
 	e.ackMu.Unlock()
+}
+
+func (e *Engine) markSeenRemoteForever(backendName, name string) {
+	e.ackMu.Lock()
+	e.seenRemote[backendName+"|"+name] = time.Now().Add(100 * 365 * 24 * time.Hour)
+	e.ackMu.Unlock()
+}
+
+func (e *Engine) filterSeenRemote(backendName string, names []string) []string {
+	if len(names) == 0 {
+		return names
+	}
+
+	cutoff := e.opts.StaleUnackedFileTTL
+	out := names[:0]
+
+	e.ackMu.Lock()
+	for _, name := range names {
+		seenAt := e.seenRemote[backendName+"|"+name]
+		if !seenAt.IsZero() && time.Since(seenAt) < cutoff {
+			continue
+		}
+		out = append(out, name)
+	}
+	e.ackMu.Unlock()
+
+	return out
 }
 
 func (e *Engine) shouldLogOrphan(seq uint64) bool {
@@ -1195,12 +1249,34 @@ func (e *Engine) shouldDropStartupOpen(createdUnixMs int64) bool {
 	return createdUnixMs+startupGrace < e.startedAtUnixMs
 }
 
-func (e *Engine) discardStartupBacklog(ctx context.Context) {
+func (e *Engine) configureBackendListCutoff() map[string]struct{} {
+	const startupGrace = int64(15 * time.Second / time.Millisecond)
+	cutoff := e.startedAtUnixMs - startupGrace
+	if cutoff < 0 {
+		cutoff = 0
+	}
+	e.startupCutoffMs = cutoff
+
+	type listCreatedAfterSetter interface {
+		SetListCreatedAfter(unixMs int64)
+	}
+
+	configured := make(map[string]struct{})
 	for _, backend := range e.pool.Backends() {
-		if _, ok := backend.Backend.(interface {
-			SetListCreatedAfter(unixMs int64)
-		}); ok {
-			log.Printf("startup stale discard backend=%s mode=cutoff", backend.Name)
+		setter, ok := backend.Backend.(listCreatedAfterSetter)
+		if !ok {
+			continue
+		}
+		setter.SetListCreatedAfter(cutoff)
+		configured[backend.Name] = struct{}{}
+		log.Printf("startup list cutoff backend=%s created_after_ms=%d", backend.Name, cutoff)
+	}
+	return configured
+}
+
+func (e *Engine) discardStartupBacklog(ctx context.Context, cutoffConfigured map[string]struct{}) {
+	for _, backend := range e.pool.Backends() {
+		if _, ok := cutoffConfigured[backend.Name]; ok {
 			continue
 		}
 
@@ -1218,53 +1294,30 @@ func (e *Engine) discardStartupBacklog(ctx context.Context) {
 			continue
 		}
 
-		maxSeqBySession := make(map[string]uint64)
+		sessions := make(map[string]struct{})
 		segmentCount := 0
 		for _, name := range files {
-			dir, clientID, sessionID, seq, ok := parseSegmentFilename(name)
+			dir, clientID, sessionID, _, ok := parseSegmentFilename(name)
 			if !ok || dir != e.peerDir {
 				continue
 			}
 			segmentCount++
-			key := clientID + "|" + sessionID
-			current, exists := maxSeqBySession[key]
-			if !exists || seq > current {
-				maxSeqBySession[key] = seq
-			}
-			e.markSeenRemote(backend.Name, name)
+			sessions[clientID+"|"+sessionID] = struct{}{}
+			e.markSeenRemoteForever(backend.Name, name)
 		}
 
-		if len(maxSeqBySession) == 0 {
+		if len(sessions) == 0 {
 			continue
 		}
 
-		for key, maxSeq := range maxSeqBySession {
-			clientID, sessionID, ok := strings.Cut(key, "|")
+		for key := range sessions {
+			_, sessionID, ok := strings.Cut(key, "|")
 			if !ok {
 				continue
 			}
 			e.markClosedSession(sessionID)
-			e.noteAck(backend.Name, clientID, sessionID, maxSeq)
 		}
-		log.Printf("startup stale discard backend=%s sessions=%d segments=%d", backend.Name, len(maxSeqBySession), segmentCount)
-	}
-	e.flushAckStates(ctx)
-}
-
-func (e *Engine) applyBackendListCutoff() {
-	cutoff := e.startedAtUnixMs - int64(5*time.Second/time.Millisecond)
-	if cutoff < 0 {
-		cutoff = 0
-	}
-	for _, backend := range e.pool.Backends() {
-		filterable, ok := backend.Backend.(interface {
-			SetListCreatedAfter(unixMs int64)
-		})
-		if !ok {
-			continue
-		}
-		filterable.SetListCreatedAfter(cutoff)
-		log.Printf("backend %s list cutoff applied created_after=%d", backend.Name, cutoff)
+		log.Printf("startup stale discard backend=%s mode=local-ignore sessions=%d segments=%d", backend.Name, len(sessions), segmentCount)
 	}
 }
 
