@@ -7,6 +7,8 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,6 +95,74 @@ func TestMultipartBodyOmitsParentsForUpdate(t *testing.T) {
 	updateMeta := decodeMultipartMeta(t, updateContentType, updateBody)
 	if _, ok := updateMeta["parents"]; ok {
 		t.Fatalf("expected update metadata to omit parents, got %v", updateMeta["parents"])
+	}
+}
+
+func TestValidateFolderAcceptsAccessibleDriveFolder(t *testing.T) {
+	t.Parallel()
+
+	backend := &GoogleBackend{
+		apiClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/drive/v3/files/folder-123" {
+				t.Fatalf("unexpected path %q", r.URL.Path)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+				t.Fatalf("Authorization = %q, want Bearer test-token", got)
+			}
+			if got := r.URL.Query().Get("supportsAllDrives"); got != "true" {
+				t.Fatalf("supportsAllDrives = %q, want true", got)
+			}
+			return jsonResponse(http.StatusOK, `{"id":"folder-123","name":"Flow-Data","mimeType":"application/vnd.google-apps.folder","trashed":false}`), nil
+		})},
+		tokenClient:     http.DefaultClient,
+		credentialsPath: "/tmp/credentials.json",
+		folderID:        "folder-123",
+		token:           "test-token",
+		tokenEx:         time.Now().Add(time.Hour),
+	}
+
+	if err := backend.ValidateFolder(context.Background()); err != nil {
+		t.Fatalf("ValidateFolder failed: %v", err)
+	}
+}
+
+func TestValidateFolderReturnsReauthHintForInaccessibleConfiguredFolder(t *testing.T) {
+	t.Parallel()
+
+	backend := &GoogleBackend{
+		apiClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusNotFound, `{"error":{"message":"File not found"}}`), nil
+		})},
+		tokenClient:     http.DefaultClient,
+		credentialsPath: "/tmp/credentials.json",
+		folderID:        "folder-123",
+		token:           "test-token",
+		tokenEx:         time.Now().Add(time.Hour),
+	}
+
+	err := backend.ValidateFolder(context.Background())
+	if err == nil {
+		t.Fatalf("ValidateFolder unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "folder_id \"folder-123\" is not accessible") {
+		t.Fatalf("expected inaccessible-folder hint, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "/tmp/credentials.json.token") {
+		t.Fatalf("expected token cache hint, got %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
+
+func jsonResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 

@@ -32,6 +32,8 @@ type oauthClientJSON struct {
 	} `json:"installed"`
 }
 
+const googleDriveScope = "https://www.googleapis.com/auth/drive"
+
 type tokenCache struct {
 	RefreshToken string `json:"refresh_token"`
 }
@@ -181,8 +183,8 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		}
 	}
 
-	link := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
-		b.authURI, url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI))
+	link := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&access_type=offline",
+		b.authURI, url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI), url.QueryEscape(googleDriveScope))
 
 	fmt.Printf("\n==================== OAUTH AUTHENTICATION REQUIRED ====================\n")
 	fmt.Printf("1. Please open this URL in your web browser:\n\n%s\n\n", link)
@@ -315,6 +317,58 @@ func (b *GoogleBackend) getValidToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return b.token, nil
+}
+
+func (b *GoogleBackend) ValidateFolder(ctx context.Context) error {
+	if strings.TrimSpace(b.folderID) == "" {
+		return nil
+	}
+
+	tok, err := b.getValidToken(ctx)
+	if err != nil {
+		return err
+	}
+	if err := b.limit(ctx, "folder validate"); err != nil {
+		return err
+	}
+
+	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files/" + url.PathEscape(b.folderID))
+	values := u.Query()
+	values.Set("fields", "id,name,mimeType,trashed")
+	values.Set("supportsAllDrives", "true")
+	u.RawQuery = values.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	resp, err := b.apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return b.wrapFolderAccessError(readHTTPError("validate folder", resp))
+	}
+
+	var res struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		MimeType string `json:"mimeType"`
+		Trashed  bool   `json:"trashed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return fmt.Errorf("failed to decode folder metadata for %q: %w", b.folderID, err)
+	}
+	if res.Trashed {
+		return fmt.Errorf("configured folder_id %q points to a trashed Drive item", b.folderID)
+	}
+	if res.MimeType != "application/vnd.google-apps.folder" {
+		return fmt.Errorf("configured folder_id %q points to %q, not a Drive folder", b.folderID, res.Name)
+	}
+	return nil
 }
 
 func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
@@ -609,6 +663,8 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 	values := u.Query()
 	values.Set("q", q)
 	values.Set("fields", "nextPageToken,files(id,name)")
+	values.Set("includeItemsFromAllDrives", "true")
+	values.Set("supportsAllDrives", "true")
 	u.RawQuery = values.Encode()
 
 	tok, err := b.getValidToken(ctx)
@@ -722,6 +778,8 @@ func (b *GoogleBackend) queryFiles(ctx context.Context, query string) ([]googleF
 			values.Set("q", query)
 			values.Set("fields", "nextPageToken,files(id,name)")
 			values.Set("pageSize", "1000")
+			values.Set("includeItemsFromAllDrives", "true")
+			values.Set("supportsAllDrives", "true")
 			if pageToken != "" {
 				values.Set("pageToken", pageToken)
 			}
@@ -838,6 +896,21 @@ func (b *GoogleBackend) onRetry(op string, attempt int, err error, delay time.Du
 			return
 		}
 		b.setHealth(HealthDegraded)
+	}
+}
+
+func (b *GoogleBackend) wrapFolderAccessError(err error) error {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return err
+	}
+
+	switch statusErr.StatusCode {
+	case http.StatusForbidden, http.StatusNotFound:
+		tokenCachePath := b.credentialsPath + ".token"
+		return fmt.Errorf("configured folder_id %q is not accessible to this OAuth client/token; if the folder was recreated or moved under a different Google app/account, delete %s and authenticate again: %w", b.folderID, tokenCachePath, err)
+	default:
+		return err
 	}
 }
 

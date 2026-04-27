@@ -138,6 +138,8 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 				cfg.GoogleFolderID = folderID
 				updatedConfig = true
 			}
+		} else if err := gb.ValidateFolder(ctx); err != nil {
+			return nil, fmt.Errorf("backend %s folder validation failed: %w", backendCfg.Name, err)
 		}
 
 		log.Printf("backend %s ready folder=%s weight=%d", backendCfg.Name, backends[i].FolderID, backendCfg.Weight)
