@@ -275,13 +275,51 @@ func (e *Engine) flushLoop(ctx context.Context) {
 	ticker := time.NewTicker(e.opts.FlushRate)
 	defer ticker.Stop()
 
+	debounce := e.forceFlushDebounceInterval()
+	var forceTimer *time.Timer
+	var forceTimerCh <-chan time.Time
+
+	stopForceTimer := func() {
+		if forceTimer == nil {
+			return
+		}
+		if !forceTimer.Stop() {
+			select {
+			case <-forceTimer.C:
+			default:
+			}
+		}
+		forceTimer = nil
+		forceTimerCh = nil
+	}
+	scheduleForceFlush := func() {
+		if debounce <= 0 {
+			e.flushAll(true, false)
+			return
+		}
+		if forceTimer != nil {
+			return
+		}
+		forceTimer = time.NewTimer(debounce)
+		forceTimerCh = forceTimer.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			stopForceTimer()
 			return
 		case force := <-e.flushCh:
-			e.flushAll(force, false)
+			if force {
+				scheduleForceFlush()
+				continue
+			}
+			e.flushAll(false, false)
+		case <-forceTimerCh:
+			stopForceTimer()
+			e.flushAll(true, false)
 		case <-ticker.C:
+			stopForceTimer()
 			e.flushAll(true, true)
 		}
 	}
@@ -466,6 +504,7 @@ func (e *Engine) triggerUploads(ctx context.Context) {
 }
 
 func (e *Engine) uploadSegment(ctx context.Context, backend *storage.BackendHandle, seg *spoolSegment, uploadKey string) {
+	defer e.signalUpload()
 	defer releaseSemaphore(e.uploadSem)
 	defer e.finishUpload(uploadKey)
 
@@ -1460,6 +1499,17 @@ func (e *Engine) currentPollInterval() time.Duration {
 	return e.opts.IdlePollRate
 }
 
+func (e *Engine) forceFlushDebounceInterval() time.Duration {
+	debounce := e.opts.FlushRate / 4
+	if debounce < 15*time.Millisecond {
+		debounce = 15 * time.Millisecond
+	}
+	if debounce > 75*time.Millisecond {
+		debounce = 75 * time.Millisecond
+	}
+	return debounce
+}
+
 func (e *Engine) backendForSession(s *Session) (*storage.BackendHandle, error) {
 	if s.BackendName != "" {
 		if backend := e.pool.Get(s.BackendName); backend != nil {
@@ -1481,6 +1531,10 @@ func (e *Engine) addPending(seg *spoolSegment) {
 	e.pendingMu.Lock()
 	e.pending[e.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)] = seg
 	e.pendingMu.Unlock()
+	e.signalUpload()
+}
+
+func (e *Engine) signalUpload() {
 	select {
 	case e.uploadCh <- struct{}{}:
 	default:

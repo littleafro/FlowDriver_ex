@@ -21,6 +21,16 @@ func newTestEngine(t *testing.T, isClient bool) (*Engine, *storage.FakeBackend) 
 	return engine, backend
 }
 
+func drainUploadSignals(ch chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
 func TestSessionDoesNotCloseBeforeConfiguredIdleTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -454,6 +464,92 @@ func TestTriggerUploadsDoesNotDuplicateInFlight(t *testing.T) {
 
 	if got := backend.UploadCalls(name); got != 1 {
 		t.Fatalf("expected single upload attempt for in-flight segment, got %d", got)
+	}
+}
+
+func TestUploadSegmentSignalsUploadLoopAfterCompletion(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+	session := NewSession("s-upload-signal")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("hello"))
+	engine.flushAll(true, false)
+
+	segments := engine.pendingSnapshot()
+	if len(segments) != 1 {
+		t.Fatalf("expected one pending segment, got %d", len(segments))
+	}
+	seg := segments[0]
+	uploadKey := engine.pendingKey(seg.Meta.BackendName, seg.Meta.RemoteName)
+
+	drainUploadSignals(engine.uploadCh)
+	engine.uploadSegment(context.Background(), engine.pool.Get("default"), seg, uploadKey)
+
+	select {
+	case <-engine.uploadCh:
+	default:
+		t.Fatalf("expected upload completion to signal upload loop")
+	}
+}
+
+func TestForceFlushDebounceIntervalClamp(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+
+	engine.opts.FlushRate = 5 * time.Millisecond
+	if got := engine.forceFlushDebounceInterval(); got != 15*time.Millisecond {
+		t.Fatalf("expected min debounce 15ms, got %s", got)
+	}
+
+	engine.opts.FlushRate = 10 * time.Second
+	if got := engine.forceFlushDebounceInterval(); got != 75*time.Millisecond {
+		t.Fatalf("expected max debounce 75ms, got %s", got)
+	}
+
+	engine.opts.FlushRate = 200 * time.Millisecond
+	if got := engine.forceFlushDebounceInterval(); got != 50*time.Millisecond {
+		t.Fatalf("expected debounce 50ms for 200ms flush, got %s", got)
+	}
+}
+
+func TestFlushLoopCoalescesForceFlushBurst(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+	engine.opts.FlushRate = time.Second
+	engine.opts.SegmentBytes = 1024
+	engine.opts.MaxSegmentBytes = 1
+	engine.opts.MaxMuxSegments = 1
+
+	session := NewSession("s-burst")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("abcdef"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go engine.flushLoop(ctx)
+
+	for i := 0; i < 32; i++ {
+		engine.notifyForceFlush()
+	}
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for {
+		if len(engine.pendingSnapshot()) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for coalesced force flush")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := len(engine.pendingSnapshot()); got != 1 {
+		t.Fatalf("expected one segment from coalesced force flush burst, got %d", got)
 	}
 }
 
