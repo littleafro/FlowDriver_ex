@@ -188,6 +188,10 @@ func TestProcessMuxFileDeletesRemoteObjectAfterDelivery(t *testing.T) {
 
 	engine.processMuxFile(context.Background(), engine.pool.Get("default"), name)
 
+	deadline := time.Now().Add(2 * time.Second)
+	for backend.HasFile(name) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if backend.HasFile(name) {
 		t.Fatalf("receiver should delete mux file after processing")
 	}
@@ -270,6 +274,10 @@ func TestProcessMuxFileRetainsFileUntilAllEnvelopesCanBeApplied(t *testing.T) {
 	engine.processMuxFile(context.Background(), engine.pool.Get("default"), openName)
 	engine.processMuxFile(context.Background(), engine.pool.Get("default"), dataName)
 
+	deadline := time.Now().Add(2 * time.Second)
+	for backend.HasFile(dataName) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if backend.HasFile(dataName) {
 		t.Fatalf("mux file should delete after retry succeeds")
 	}

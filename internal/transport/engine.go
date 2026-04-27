@@ -1022,12 +1022,38 @@ func (e *Engine) processMuxFile(ctx context.Context, backend *storage.BackendHan
 		return
 	}
 
-	if err := backend.Backend.Delete(ctx, name); err != nil {
-		e.markSeenRemote(backend.Name, name)
-		log.Printf("mux delete error backend=%s file=%s: %v", backend.Name, name, err)
-	} else {
-		log.Printf("cleanup action backend=%s deleted=%s", backend.Name, name)
-	}
+	// Keep mux delivery hot: don't block further downloads on delete latency.
+	e.markSeenRemote(backend.Name, name)
+	e.deleteMuxFileAsync(ctx, backend, name)
+}
+
+func (e *Engine) deleteMuxFileAsync(ctx context.Context, backend *storage.BackendHandle, name string) {
+	go func() {
+		select {
+		case e.deleteSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		defer releaseSemaphore(e.deleteSem)
+
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := backend.Backend.Delete(ctx, name); err != nil {
+				lastErr = err
+				if ctx.Err() != nil {
+					return
+				}
+				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				continue
+			}
+			log.Printf("cleanup action backend=%s deleted=%s", backend.Name, name)
+			return
+		}
+
+		if lastErr != nil {
+			log.Printf("mux delete error backend=%s file=%s: %v", backend.Name, name, lastErr)
+		}
+	}()
 }
 
 func (e *Engine) processAckFile(ctx context.Context, backend *storage.BackendHandle, name string) {
