@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -550,6 +551,59 @@ func TestFlushLoopCoalescesForceFlushBurst(t *testing.T) {
 
 	if got := len(engine.pendingSnapshot()); got != 1 {
 		t.Fatalf("expected one segment from coalesced force flush burst, got %d", got)
+	}
+}
+
+func TestBackendForSessionPrefersLessLoadedBackend(t *testing.T) {
+	t.Parallel()
+
+	opts := DefaultOptions()
+	opts.DataDir = t.TempDir()
+	engine := NewEngineWithPool(storage.NewBackendPool(
+		&storage.BackendHandle{Name: "g1", Weight: 1, Backend: storage.NewFakeBackend()},
+		&storage.BackendHandle{Name: "g2", Weight: 1, Backend: storage.NewFakeBackend()},
+	), true, "c1", opts)
+
+	for i := 0; i < 3; i++ {
+		s := NewSession(fmt.Sprintf("busy-%d", i))
+		s.ClientID = "c1"
+		s.BackendName = "g1"
+		engine.AddSession(s)
+	}
+
+	newSession := NewSession("new-session")
+	newSession.ClientID = "c1"
+	backend, err := engine.backendForSession(newSession)
+	if err != nil {
+		t.Fatalf("backendForSession failed: %v", err)
+	}
+	if backend.Name != "g2" {
+		t.Fatalf("expected less-loaded backend g2, got %s", backend.Name)
+	}
+}
+
+func TestPollAllBackendsRunsConcurrently(t *testing.T) {
+	t.Parallel()
+
+	opts := DefaultOptions()
+	opts.DataDir = t.TempDir()
+
+	b1 := storage.NewFakeBackend()
+	b2 := storage.NewFakeBackend()
+	delay := 150 * time.Millisecond
+	b1.SetListDelay(delay)
+	b2.SetListDelay(delay)
+
+	engine := NewEngineWithPool(storage.NewBackendPool(
+		&storage.BackendHandle{Name: "g1", Weight: 1, Backend: b1},
+		&storage.BackendHandle{Name: "g2", Weight: 1, Backend: b2},
+	), true, "c1", opts)
+
+	start := time.Now()
+	engine.pollAllBackends(context.Background())
+	elapsed := time.Since(start)
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("expected concurrent polling (<250ms), got %s", elapsed)
 	}
 }
 

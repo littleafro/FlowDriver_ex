@@ -31,6 +31,7 @@ type FakeBackend struct {
 	downloadFailures int
 	deleteFailures   int
 	visibilityDelay  time.Duration
+	listDelay        time.Duration
 	deleteDelay      time.Duration
 	duplicateList    map[string]int
 	reverseList      bool
@@ -100,6 +101,13 @@ func (b *FakeBackend) Put(ctx context.Context, filename string, data io.Reader) 
 }
 
 func (b *FakeBackend) ListQuery(ctx context.Context, prefix string) ([]string, error) {
+	b.mu.Lock()
+	delay := b.listDelay
+	b.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.fail("list"); err != nil {
@@ -201,6 +209,12 @@ func (b *FakeBackend) SetVisibilityDelay(d time.Duration) {
 func (b *FakeBackend) SetDeleteDelay(d time.Duration) {
 	b.mu.Lock()
 	b.deleteDelay = d
+	b.mu.Unlock()
+}
+
+func (b *FakeBackend) SetListDelay(d time.Duration) {
+	b.mu.Lock()
+	b.listDelay = d
 	b.mu.Unlock()
 }
 

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -621,12 +623,30 @@ func (e *Engine) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			for _, backend := range e.pool.Backends() {
-				e.pollBackend(ctx, backend)
-			}
+			e.pollAllBackends(ctx)
 			timer.Reset(e.currentPollInterval())
 		}
 	}
+}
+
+func (e *Engine) pollAllBackends(ctx context.Context) {
+	backends := e.pool.Backends()
+	if len(backends) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, backend := range backends {
+		if backend == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(be *storage.BackendHandle) {
+			defer wg.Done()
+			e.pollBackend(ctx, be)
+		}(backend)
+	}
+	wg.Wait()
 }
 
 func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle) {
@@ -1520,11 +1540,72 @@ func (e *Engine) backendForSession(s *Session) (*storage.BackendHandle, error) {
 	if clientID == "" {
 		clientID = e.id
 	}
-	backend, err := e.pool.Select(fmt.Sprintf("%s/%s/%s", e.opts.TunnelID, clientID, s.ID))
-	if err != nil {
-		return nil, err
+
+	candidates := e.pool.HealthyBackends()
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no healthy backends available")
 	}
-	return backend, nil
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+
+	sessionKey := fmt.Sprintf("%s/%s/%s", e.opts.TunnelID, clientID, s.ID)
+	backendLoads := e.backendLoadSnapshot()
+
+	var (
+		best          *storage.BackendHandle
+		bestLoadScore        = math.Inf(1)
+		bestHashScore uint64 = ^uint64(0)
+	)
+	for _, candidate := range candidates {
+		weight := candidate.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		loadScore := float64(backendLoads[candidate.Name]) / float64(weight)
+		hashScore := backendTieScore(sessionKey, candidate.Name)
+		if loadScore < bestLoadScore || (loadScore == bestLoadScore && hashScore < bestHashScore) {
+			best = candidate
+			bestLoadScore = loadScore
+			bestHashScore = hashScore
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("failed to select backend")
+	}
+	return best, nil
+}
+
+func (e *Engine) backendLoadSnapshot() map[string]int {
+	loads := make(map[string]int)
+
+	e.sessionMu.RLock()
+	for _, s := range e.sessions {
+		if s.BackendName == "" {
+			continue
+		}
+		loads[s.BackendName]++
+	}
+	e.sessionMu.RUnlock()
+
+	e.pendingMu.RLock()
+	for _, seg := range e.pending {
+		if seg.Meta.BackendName == "" || seg.Meta.Uploaded {
+			continue
+		}
+		loads[seg.Meta.BackendName]++
+	}
+	e.pendingMu.RUnlock()
+
+	return loads
+}
+
+func backendTieScore(sessionKey, backendName string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sessionKey))
+	_, _ = h.Write([]byte("::"))
+	_, _ = h.Write([]byte(backendName))
+	return h.Sum64()
 }
 
 func (e *Engine) addPending(seg *spoolSegment) {
