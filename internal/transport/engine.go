@@ -605,6 +605,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 		return
 	}
 	segmentFiles = e.filterSeenRemote(backend.Name, segmentFiles)
+	segmentFiles = dedupeStrings(segmentFiles)
 	muxFiles := make([]string, 0)
 	legacyFiles := make([]string, 0, len(segmentFiles))
 	for _, name := range segmentFiles {
@@ -616,52 +617,87 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 	}
 
 	if len(muxFiles) > 0 {
-		clientBatches := make(map[string][]string)
-		clientOrder := make([]string, 0)
-		for _, name := range muxFiles {
-			_, clientID, _, ok := parseMuxFilename(name)
-			if !ok {
-				continue
-			}
-			key := backend.Name + "|" + clientID
-			if _, exists := clientBatches[key]; !exists {
-				clientOrder = append(clientOrder, key)
-			}
-			clientBatches[key] = append(clientBatches[key], name)
-		}
+		sort.Strings(muxFiles)
 
-		for key := range clientBatches {
-			sort.Strings(clientBatches[key])
-		}
+		if e.opts.MaxOutOfOrderSegments <= 1 {
+			// Strict ordering mode: preserve per-client file order when out-of-order
+			// buffering is disabled/tight.
+			clientBatches := make(map[string][]string)
+			clientOrder := make([]string, 0)
+			for _, name := range muxFiles {
+				_, clientID, _, ok := parseMuxFilename(name)
+				if !ok {
+					continue
+				}
+				key := backend.Name + "|" + clientID
+				if _, exists := clientBatches[key]; !exists {
+					clientOrder = append(clientOrder, key)
+				}
+				clientBatches[key] = append(clientBatches[key], name)
+			}
 
-		muxWorkers := e.opts.MaxConcurrentDownloads
-		if muxWorkers < 1 {
-			muxWorkers = 1
-		}
-		if muxWorkers > len(clientOrder) {
-			muxWorkers = len(clientOrder)
-		}
-		if muxWorkers == 0 {
-			muxWorkers = 1
-		}
-		muxJobs := make(chan []string, muxWorkers)
-		var muxWG sync.WaitGroup
-		for i := 0; i < muxWorkers; i++ {
-			muxWG.Add(1)
-			go func() {
-				defer muxWG.Done()
-				for batch := range muxJobs {
-					for _, name := range batch {
+			for key := range clientBatches {
+				sort.Strings(clientBatches[key])
+			}
+
+			muxWorkers := e.opts.MaxConcurrentDownloads
+			if muxWorkers < 1 {
+				muxWorkers = 1
+			}
+			if muxWorkers > len(clientOrder) {
+				muxWorkers = len(clientOrder)
+			}
+			if muxWorkers == 0 {
+				muxWorkers = 1
+			}
+			muxJobs := make(chan []string, muxWorkers)
+			var muxWG sync.WaitGroup
+			for i := 0; i < muxWorkers; i++ {
+				muxWG.Add(1)
+				go func() {
+					defer muxWG.Done()
+					for batch := range muxJobs {
+						for _, name := range batch {
+							e.processMuxFile(ctx, backend, name)
+						}
+					}
+				}()
+			}
+			for _, key := range clientOrder {
+				muxJobs <- clientBatches[key]
+			}
+			close(muxJobs)
+			muxWG.Wait()
+		} else {
+			// Fast path: allow concurrent mux processing to avoid serializing all
+			// files behind a single client stream.
+			muxWorkers := e.opts.MaxConcurrentDownloads
+			if muxWorkers < 1 {
+				muxWorkers = 1
+			}
+			if muxWorkers > len(muxFiles) {
+				muxWorkers = len(muxFiles)
+			}
+			if muxWorkers == 0 {
+				muxWorkers = 1
+			}
+			muxJobs := make(chan string, muxWorkers)
+			var muxWG sync.WaitGroup
+			for i := 0; i < muxWorkers; i++ {
+				muxWG.Add(1)
+				go func() {
+					defer muxWG.Done()
+					for name := range muxJobs {
 						e.processMuxFile(ctx, backend, name)
 					}
-				}
-			}()
+				}()
+			}
+			for _, name := range muxFiles {
+				muxJobs <- name
+			}
+			close(muxJobs)
+			muxWG.Wait()
 		}
-		for _, key := range clientOrder {
-			muxJobs <- clientBatches[key]
-		}
-		close(muxJobs)
-		muxWG.Wait()
 	}
 
 	if len(legacyFiles) == 0 {
@@ -674,6 +710,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 			log.Printf("poll ack list error backend=%s prefix=%s: %v", backend.Name, ackPrefix, err)
 			return
 		}
+		ackFiles = dedupeStrings(ackFiles)
 		for _, name := range ackFiles {
 			e.processAckFile(ctx, backend, name)
 		}
@@ -735,6 +772,7 @@ func (e *Engine) pollBackend(ctx context.Context, backend *storage.BackendHandle
 		log.Printf("poll ack list error backend=%s prefix=%s: %v", backend.Name, ackPrefix, err)
 		return
 	}
+	ackFiles = dedupeStrings(ackFiles)
 	for _, name := range ackFiles {
 		e.processAckFile(ctx, backend, name)
 	}
@@ -1611,7 +1649,7 @@ func (e *Engine) applyReceivedSegment(backendName, clientID, sessionID, remoteNa
 		e.metrics.bytesS2C += uint64(len(env.Payload))
 	}
 	e.metrics.mu.Unlock()
-	log.Printf("segment downloaded backend=%s file=%s seq=%d", backendName, remoteName, env.Seq)
+	log.Printf("segment downloaded backend=%s file=%s session=%s seq=%d", backendName, remoteName, sessionID, env.Seq)
 	return true
 }
 
@@ -1860,6 +1898,22 @@ func releaseSemaphore(sem chan struct{}) {
 	case <-sem:
 	default:
 	}
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) <= 1 {
+		return values
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := values[:0]
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (e *Engine) closeDrainTimeout() time.Duration {
