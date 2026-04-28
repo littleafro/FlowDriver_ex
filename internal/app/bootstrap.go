@@ -42,6 +42,7 @@ func BuildEngineOptions(cfg *config.AppConfig) transport.Options {
 		AckInterval:                  time.Duration(cfg.AckIntervalMs) * time.Millisecond,
 		Compression:                  cfg.Compression,
 		CompressionMinBytes:          cfg.CompressionMinBytes,
+		UploadInterval:               time.Duration(cfg.UploadIntervalMs) * time.Millisecond,
 	}
 	opts.ApplyDefaults()
 	return opts
@@ -94,12 +95,12 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 				RetryForeverForPendingUploads: cfg.RetryForeverForPendingUploads(),
 			},
 			RateLimits: storage.RateLimitConfig{
-				MaxReadsPerSecond:       backendCfg.RateLimits.MaxReadsPerSecond,
-				MaxWritesPerSecond:      backendCfg.RateLimits.MaxWritesPerSecond,
-				MaxDeletesPerSecond:     backendCfg.RateLimits.MaxDeletesPerSecond,
-				MaxRequestsPerMinute:    backendCfg.RateLimits.MaxRequestsPerMinute,
-				MaxDailyUploadBytes:     backendCfg.RateLimits.MaxDailyUploadBytes,
-				MaxDailyDownloadBytes:   backendCfg.RateLimits.MaxDailyDownloadBytes,
+				MaxReadsPerSecond:       applyRateLimitScale(backendCfg.RateLimits.MaxReadsPerSecond, cfg.RateLimitScale),
+				MaxWritesPerSecond:      applyRateLimitScale(backendCfg.RateLimits.MaxWritesPerSecond, cfg.RateLimitScale),
+				MaxDeletesPerSecond:     applyRateLimitScale(backendCfg.RateLimits.MaxDeletesPerSecond, cfg.RateLimitScale),
+				MaxRequestsPerMinute:    applyRateLimitScale(backendCfg.RateLimits.MaxRequestsPerMinute, cfg.RateLimitScale),
+				MaxDailyUploadBytes:     applyRateLimitScaleInt(backendCfg.RateLimits.MaxDailyUploadBytes, cfg.RateLimitScale),
+				MaxDailyDownloadBytes:   applyRateLimitScaleInt(backendCfg.RateLimits.MaxDailyDownloadBytes, cfg.RateLimitScale),
 				StopWhenBudgetExhausted: backendCfg.RateLimits.StopWhenBudgetExhausted,
 			},
 		})
@@ -253,4 +254,18 @@ func warnGoogleTransport(name string, apiTransport httpclient.TransportConfig, t
 	if strings.Contains(tokenHost, "googleapis.com") && hostHeader != "" && !strings.Contains(hostHeader, "googleapis.com") {
 		log.Printf("warning: backend %s token_url=%q but token_transport.host_header=%q; token host header usually needs to stay on a googleapis.com hostname", name, tokenURL, tokenTransport.HostHeader)
 	}
+}
+
+func applyRateLimitScale(value float64, scale float64) float64 {
+	if scale <= 0 || scale == 1.0 {
+		return value
+	}
+	return value * scale
+}
+
+func applyRateLimitScaleInt(value int64, scale float64) int64 {
+	if scale <= 0 || scale == 1.0 {
+		return value
+	}
+	return int64(float64(value) * scale)
 }

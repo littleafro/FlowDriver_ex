@@ -47,6 +47,8 @@ const (
 	DefaultRetryMaxRetriesPerOperation   = 6
 	DefaultRetryForeverForPendingUploads = true
 	DefaultBackendWeight                 = 1
+	DefaultUploadIntervalMs              = 250
+	DefaultRateLimitScale                = 1.0
 )
 
 type RetryConfig struct {
@@ -157,6 +159,9 @@ type AppConfig struct {
 
 	Compression         string `json:"compression,omitempty"`
 	CompressionMinBytes int    `json:"compression_min_bytes,omitempty"`
+
+	RateLimitScale   float64 `json:"rate_limit_scale,omitempty"`
+	UploadIntervalMs int     `json:"upload_interval_ms,omitempty"`
 
 	RejectRawIP       *bool    `json:"reject_raw_ip,omitempty"`
 	WarnRawIP         *bool    `json:"warn_raw_ip,omitempty"`
@@ -390,6 +395,12 @@ func (c *AppConfig) Normalize() {
 	c.Compression = strings.ToLower(c.Compression)
 	if c.CompressionMinBytes <= 0 {
 		c.CompressionMinBytes = DefaultCompressionMinBytes
+	}
+	if c.RateLimitScale <= 0 {
+		c.RateLimitScale = DefaultRateLimitScale
+	}
+	if c.UploadIntervalMs <= 0 {
+		c.UploadIntervalMs = DefaultUploadIntervalMs
 	}
 	if c.RejectRawIP == nil {
 		c.RejectRawIP = boolPtr(false)

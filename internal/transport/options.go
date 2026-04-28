@@ -29,6 +29,7 @@ type Options struct {
 	AckInterval                  time.Duration
 	Compression                  string
 	CompressionMinBytes          int
+	UploadInterval               time.Duration
 }
 
 func DefaultOptions() Options {
@@ -57,6 +58,7 @@ func DefaultOptions() Options {
 		AckInterval:                  time.Second,
 		Compression:                  "off",
 		CompressionMinBytes:          4096,
+		UploadInterval:               250 * time.Millisecond,
 	}
 }
 
@@ -133,5 +135,8 @@ func (o *Options) ApplyDefaults() {
 	}
 	if o.CompressionMinBytes <= 0 {
 		o.CompressionMinBytes = def.CompressionMinBytes
+	}
+	if o.UploadInterval <= 0 {
+		o.UploadInterval = def.UploadInterval
 	}
 }

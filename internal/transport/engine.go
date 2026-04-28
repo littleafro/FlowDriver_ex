@@ -449,7 +449,7 @@ func (e *Engine) flushAll(force, allowHeartbeat bool) {
 }
 
 func (e *Engine) uploadLoop(ctx context.Context) {
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(e.opts.UploadInterval)
 	defer ticker.Stop()
 	for {
 		select {
