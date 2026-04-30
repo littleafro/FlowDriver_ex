@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ type streamManager struct {
 	baseDir string
 	mu      sync.Mutex
 
-	streams map[Direction]*streamState
+	streams map[streamKey]*streamState
 }
 
 type streamState struct {
@@ -28,26 +29,32 @@ type streamState struct {
 	offset   int64
 }
 
+type streamKey struct {
+	dir         Direction
+	backendName string
+}
+
 func newStreamManager(baseDir string) *streamManager {
 	return &streamManager{
 		baseDir: baseDir,
-		streams: make(map[Direction]*streamState),
+		streams: make(map[streamKey]*streamState),
 	}
 }
 
-func (m *streamManager) getOrCreate(d Direction, clientID string) *streamState {
+func (m *streamManager) getOrCreate(d Direction, clientID, backendName string) *streamState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	s, ok := m.streams[d]
+	key := streamKey{dir: d, backendName: backendName}
+	s, ok := m.streams[key]
 	if !ok {
-		dir := filepath.Join(m.baseDir, "streams", string(d))
+		dir := filepath.Join(m.baseDir, "streams", backendName, string(d))
 		_ = os.MkdirAll(dir, 0755)
 		s = &streamState{
 			dataPath: filepath.Join(dir, "stream.bin"),
 			offset:   0,
 		}
-		m.streams[d] = s
+		m.streams[key] = s
 	}
 	return s
 }
@@ -56,10 +63,30 @@ func streamFile(d Direction, clientID string) string {
 	return "stream-" + string(d) + "-" + safeID(clientID) + ".bin"
 }
 
+func parseStreamFilename(name string) (Direction, string, bool) {
+	if !strings.HasSuffix(name, ".bin") {
+		return "", "", false
+	}
+	base := strings.TrimSuffix(name, ".bin")
+	parts := strings.Split(base, "-")
+	if len(parts) != 3 || parts[0] != "stream" {
+		return "", "", false
+	}
+	clientID, err := unsafeID(parts[2])
+	if err != nil {
+		return "", "", false
+	}
+	return Direction(parts[1]), clientID, true
+}
+
 // Append writes raw envelope bytes to the local stream file.
 // Returns the starting offset of the appended data.
 func (m *streamManager) Append(d Direction, clientID string, data []byte) (int64, error) {
-	s := m.getOrCreate(d, clientID)
+	return m.AppendForBackend(d, clientID, "", data)
+}
+
+func (m *streamManager) AppendForBackend(d Direction, clientID, backendName string, data []byte) (int64, error) {
+	s := m.getOrCreate(d, clientID, backendName)
 
 	f, err := os.OpenFile(s.dataPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -84,7 +111,11 @@ func (m *streamManager) Append(d Direction, clientID string, data []byte) (int64
 // Flush uploads the entire stream file to the backend.
 // Returns the total uploaded file size, or 0 if no data.
 func (m *streamManager) Flush(d Direction, clientID string, backend storage.Backend, ctx context.Context) (int64, error) {
-	s := m.getOrCreate(d, clientID)
+	return m.FlushForBackend(d, clientID, "", backend, ctx)
+}
+
+func (m *streamManager) FlushForBackend(d Direction, clientID, backendName string, backend storage.Backend, ctx context.Context) (int64, error) {
+	s := m.getOrCreate(d, clientID, backendName)
 
 	data, err := os.ReadFile(s.dataPath)
 	if err != nil {

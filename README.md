@@ -97,6 +97,7 @@ Backward compatibility is preserved for older configs that only used:
 
 ### Recommended Server Settings For A Foreign VPS
 
+- keep the same `client_id` as the client
 - keep the same `tunnel_id`
 - keep the same backend names and folder IDs
 - set `block_private_ips` to `true` unless you explicitly need RFC1918 reachability
@@ -128,6 +129,7 @@ Each backend entry may have:
 - its own weight
 
 New sessions are pinned by consistent weighted hashing. A single session’s ordered stream stays on one backend.
+If `client_id` is omitted on the server, it can auto-discover exactly one active client stream, but setting it explicitly is more reliable.
 
 ## Rate Limit Tuning
 

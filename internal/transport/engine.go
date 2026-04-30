@@ -25,25 +25,26 @@ type metrics struct {
 }
 
 type Engine struct {
-	pool         *storage.BackendPool
-	myDir        Direction
-	peerDir      Direction
-	id           string
-	opts         Options
-	sessions     map[string]*Session
-	sessionMu    sync.RWMutex
-	closedSessions   map[string]time.Time
-	closedSessionsMu sync.Mutex
-	stream       *streamManager
-	uploadSem    chan struct{}
-	downloadSem  chan struct{}
-	metrics      metrics
-	startedAtUnixMs int64
-	OnNewSession func(sessionID, targetAddr string, s *Session)
-	// Server-side: track read offset for stream file
-	serverOffset     int64
-	serverOffsetMu   sync.Mutex
-	serverOffsetDirty bool
+	pool                *storage.BackendPool
+	myDir               Direction
+	peerDir             Direction
+	idMu                sync.RWMutex
+	id                  string
+	opts                Options
+	sessions            map[string]*Session
+	sessionMu           sync.RWMutex
+	closedSessions      map[string]time.Time
+	closedSessionsMu    sync.Mutex
+	stream              *streamManager
+	uploadSem           chan struct{}
+	downloadSem         chan struct{}
+	metrics             metrics
+	startedAtUnixMs     int64
+	OnNewSession        func(sessionID, targetAddr string, s *Session)
+	streamOffsets       map[string]int64
+	streamOffsetDirty   map[string]bool
+	streamOffsetMu      sync.Mutex
+	streamOffsetsLoaded bool
 }
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
@@ -53,14 +54,16 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 func NewEngineWithPool(pool *storage.BackendPool, isClient bool, clientID string, opts Options) *Engine {
 	opts.ApplyDefaults()
 	e := &Engine{
-		pool:           pool,
-		id:             clientID,
-		opts:           opts,
-		sessions:       make(map[string]*Session),
-		closedSessions: make(map[string]time.Time),
-		stream:         newStreamManager(opts.DataDir),
-		uploadSem:      make(chan struct{}, opts.MaxConcurrentUploads),
-		downloadSem:    make(chan struct{}, opts.MaxConcurrentDownloads),
+		pool:              pool,
+		id:                clientID,
+		opts:              opts,
+		sessions:          make(map[string]*Session),
+		closedSessions:    make(map[string]time.Time),
+		stream:            newStreamManager(opts.DataDir),
+		uploadSem:         make(chan struct{}, opts.MaxConcurrentUploads),
+		downloadSem:       make(chan struct{}, opts.MaxConcurrentDownloads),
+		streamOffsets:     make(map[string]int64),
+		streamOffsetDirty: make(map[string]bool),
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -87,9 +90,7 @@ func (e *Engine) SetFlushRate(ms int) {
 
 func (e *Engine) Start(ctx context.Context) {
 	e.startedAtUnixMs = time.Now().UnixMilli()
-	if e.myDir == DirRes {
-		e.loadServerOffset(ctx)
-	}
+	e.ensureStreamContext(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
 	go e.pollLoop(ctx)
@@ -109,9 +110,7 @@ func (e *Engine) Shutdown(ctx context.Context) {
 	}
 	e.flushAll(true)
 	e.triggerUpload()
-	if e.myDir == DirRes {
-		e.flushServerOffset(ctx)
-	}
+	e.flushStreamOffsets(ctx)
 }
 
 func (e *Engine) GetSession(id string) *Session {
@@ -126,7 +125,14 @@ func (e *Engine) AddSession(s *Session) {
 	}
 	s.Configure(e.opts.MaxTxBufferBytesPerSession, e.opts.MaxOutOfOrderSegments, int(e.opts.FlushRate.Milliseconds()), e.notifyFlush, e.notifyForceFlush)
 	if s.ClientID == "" {
-		s.ClientID = e.id
+		s.ClientID = e.clientID()
+	}
+	if s.BackendName == "" {
+		if backend, err := e.selectBackendForSession(s); err == nil {
+			s.BackendName = backend.Name
+		} else {
+			log.Printf("backend selection failed session=%s: %v", s.ID, err)
+		}
 	}
 	e.sessionMu.Lock()
 	e.sessions[s.ID] = s
@@ -135,7 +141,7 @@ func (e *Engine) AddSession(s *Session) {
 	e.metrics.mu.Lock()
 	e.metrics.activeSessions = count
 	e.metrics.mu.Unlock()
-	log.Printf("session open %s client=%s", s.ID, s.ClientID)
+	log.Printf("session open %s client=%s backend=%s", s.ID, s.ClientID, s.BackendName)
 	e.notifyForceFlush()
 }
 
@@ -197,17 +203,30 @@ func (e *Engine) flushAll(force bool) {
 	}
 
 	now := time.Now()
-	var allEnvelopes [][]byte
+	payloads := make(map[string]*bytes.Buffer)
 
 	for _, s := range sessions {
 		if now.Sub(s.LastActivity()) >= e.opts.SessionIdleTimeout && !s.HasCloseQueued() {
 			log.Printf("session %s idle for %s, queuing close", s.ID, now.Sub(s.LastActivity()))
 			s.QueueClose()
 		}
+		if s.BackendName == "" {
+			backend, err := e.selectBackendForSession(s)
+			if err != nil {
+				log.Printf("backend selection failed session=%s: %v", s.ID, err)
+				continue
+			}
+			s.BackendName = backend.Name
+		}
 		envs, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force, e.opts.HeartbeatInterval > 0)
 		if err != nil {
 			log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
 			continue
+		}
+		buf := payloads[s.BackendName]
+		if buf == nil {
+			buf = &bytes.Buffer{}
+			payloads[s.BackendName] = buf
 		}
 		for i := range envs {
 			data, err := envs[i].Env.MarshalBinary()
@@ -215,26 +234,30 @@ func (e *Engine) flushAll(force bool) {
 				log.Printf("marshal envelope failed session=%s seq=%d: %v", s.ID, envs[i].Env.Seq, err)
 				continue
 			}
-			allEnvelopes = append(allEnvelopes, data)
+			buf.Write(data)
 			_ = s.CommitEnvelope(envs[i].Env, envs[i].Consumed)
 		}
 	}
 
-	if len(allEnvelopes) == 0 {
+	if len(payloads) == 0 {
 		return
 	}
 
-	var payload bytes.Buffer
-	for _, data := range allEnvelopes {
-		payload.Write(data)
-	}
-
-	_, err := e.stream.Append(e.myDir, e.id, payload.Bytes())
-	if err != nil {
-		log.Printf("stream append failed: %v", err)
+	clientID := e.clientID()
+	if clientID == "" {
 		return
 	}
-	log.Printf("flushed %d bytes to stream", len(payload.Bytes()))
+	for backendName, payload := range payloads {
+		if payload.Len() == 0 {
+			continue
+		}
+		_, err := e.stream.AppendForBackend(e.myDir, clientID, backendName, payload.Bytes())
+		if err != nil {
+			log.Printf("stream append failed backend=%s: %v", backendName, err)
+			continue
+		}
+		log.Printf("flushed %d bytes to stream backend=%s", payload.Len(), backendName)
+	}
 	e.triggerUpload()
 }
 
@@ -270,25 +293,28 @@ func (e *Engine) doUpload(ctx context.Context) {
 	}
 	defer func() { <-e.uploadSem }()
 
-	backends := e.pool.Backends()
-	if len(backends) == 0 {
+	clientID := e.clientID()
+	if clientID == "" {
 		return
 	}
-	backend := backends[0]
-
-	_, err := e.stream.Flush(e.myDir, e.id, backend.Backend, ctx)
-	if err != nil {
-		log.Printf("stream upload error backend=%s: %v", backend.Name, err)
+	for _, backend := range e.pool.Backends() {
+		size, err := e.stream.FlushForBackend(e.myDir, clientID, backend.Name, backend.Backend, ctx)
+		if err != nil {
+			log.Printf("stream upload error backend=%s: %v", backend.Name, err)
+			e.metrics.mu.Lock()
+			e.metrics.uploadErrors++
+			e.metrics.retries++
+			e.metrics.mu.Unlock()
+			continue
+		}
+		if size == 0 {
+			continue
+		}
+		log.Printf("stream uploaded backend=%s bytes=%d", backend.Name, size)
 		e.metrics.mu.Lock()
-		e.metrics.uploadErrors++
-		e.metrics.retries++
+		e.metrics.uploadAttempts++
 		e.metrics.mu.Unlock()
-		return
 	}
-	log.Printf("stream uploaded backend=%s", backend.Name)
-	e.metrics.mu.Lock()
-	e.metrics.uploadAttempts++
-	e.metrics.mu.Unlock()
 }
 
 func (e *Engine) pollLoop(ctx context.Context) {
@@ -313,45 +339,44 @@ func (e *Engine) doPoll(ctx context.Context) {
 	}
 	defer func() { <-e.downloadSem }()
 
-	backends := e.pool.Backends()
-	if len(backends) == 0 {
+	if !e.ensureStreamContext(ctx) {
 		return
 	}
-	backend := backends[0]
-
-	data, err := e.stream.DownloadStream(e.peerDir, e.id, backend.Backend, ctx)
-	if err != nil {
-		if !isNotFoundErr(err) {
-			log.Printf("stream download error backend=%s: %v", backend.Name, err)
-			e.metrics.mu.Lock()
-			e.metrics.downloadErrors++
-			e.metrics.mu.Unlock()
+	clientID := e.clientID()
+	if clientID == "" {
+		return
+	}
+	for _, backend := range e.pool.Backends() {
+		data, err := e.stream.DownloadStream(e.peerDir, clientID, backend.Backend, ctx)
+		if err != nil {
+			if !isNotFoundErr(err) {
+				log.Printf("stream download error backend=%s: %v", backend.Name, err)
+				e.metrics.mu.Lock()
+				e.metrics.downloadErrors++
+				e.metrics.mu.Unlock()
+			}
+			continue
 		}
-		return
+
+		offset := e.streamOffset(backend.Name)
+		if int64(len(data)) <= offset {
+			continue
+		}
+		newData := data[offset:]
+		e.setStreamOffset(backend.Name, int64(len(data)), true)
+
+		processed := e.processStreamData(newData, backend.Name)
+
+		e.metrics.mu.Lock()
+		e.metrics.downloadAttempts++
+		e.metrics.mu.Unlock()
+
+		log.Printf("stream downloaded backend=%s offset=%d processed=%d bytes=%d",
+			backend.Name, len(data), processed, len(newData))
 	}
-
-	e.serverOffsetMu.Lock()
-	offset := e.serverOffset
-	if int64(len(data)) <= offset {
-		e.serverOffsetMu.Unlock()
-		return
-	}
-	newData := data[offset:]
-	e.serverOffset = int64(len(data))
-	e.serverOffsetMu.Unlock()
-	e.serverOffsetDirty = true
-
-	processed := e.processStreamData(newData)
-
-	e.metrics.mu.Lock()
-	e.metrics.downloadAttempts++
-	e.metrics.mu.Unlock()
-
-	log.Printf("stream downloaded offset=%d processed=%d bytes=%d",
-		e.serverOffset, processed, len(newData))
 }
 
-func (e *Engine) processStreamData(data []byte) int {
+func (e *Engine) processStreamData(data []byte, backendName string) int {
 	processed := 0
 	off := 0
 
@@ -373,8 +398,9 @@ func (e *Engine) processStreamData(data []byte) int {
 		if session == nil {
 			if env.Kind == KindOpen {
 				session = NewSession(env.SessionID)
-				session.ClientID = e.id
+				session.ClientID = e.clientID()
 				session.TargetAddr = env.TargetAddr
+				session.BackendName = backendName
 				e.AddSession(session)
 				if e.OnNewSession != nil {
 					go e.OnNewSession(env.SessionID, env.TargetAddr, session)
@@ -383,6 +409,10 @@ func (e *Engine) processStreamData(data []byte) int {
 				off += envLen
 				continue
 			}
+		} else if session.BackendName == "" {
+			session.BackendName = backendName
+		} else if session.BackendName != backendName {
+			log.Printf("session backend mismatch session=%s existing=%s incoming=%s", env.SessionID, session.BackendName, backendName)
 		}
 
 		_, advanced, closedNow, err := session.ProcessRx(env)
@@ -455,22 +485,6 @@ func (e *Engine) currentPollInterval() time.Duration {
 	return e.opts.PollRate
 }
 
-// Server-side offset persistence
-func (e *Engine) loadServerOffset(ctx context.Context) {
-	backends := e.pool.Backends()
-	if len(backends) == 0 {
-		return
-	}
-	backend := backends[0]
-	offset, err := loadOffsetFromDrive(backend.Backend, e.myDir, e.id, ctx)
-	if err != nil {
-		log.Printf("no saved offset found, starting from 0")
-		return
-	}
-	e.serverOffset = offset.Offset
-	log.Printf("loaded server offset=%d from drive", offset.Offset)
-}
-
 func (e *Engine) offsetFlushLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -479,40 +493,9 @@ func (e *Engine) offsetFlushLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if e.serverOffsetDirty {
-				e.flushServerOffset(ctx)
-			}
+			e.flushStreamOffsets(ctx)
 		}
 	}
-}
-
-func (e *Engine) flushServerOffset(ctx context.Context) {
-	e.serverOffsetMu.Lock()
-	if !e.serverOffsetDirty {
-		e.serverOffsetMu.Unlock()
-		return
-	}
-	offset := e.serverOffset
-	e.serverOffsetDirty = false
-	e.serverOffsetMu.Unlock()
-
-	backends := e.pool.Backends()
-	if len(backends) == 0 {
-		return
-	}
-	backend := backends[0]
-	off := streamOffset{
-		Dir:            e.myDir,
-		ClientID:       e.id,
-		Offset:         offset,
-		LastUploadedMs: time.Now().UnixMilli(),
-	}
-	if err := saveOffsetToDrive(off, backend.Backend, ctx); err != nil {
-		log.Printf("failed to save offset: %v", err)
-		e.serverOffsetDirty = true
-		return
-	}
-	log.Printf("saved server offset=%d", offset)
 }
 
 func (e *Engine) maintenanceLoop(ctx context.Context) {
@@ -562,4 +545,147 @@ func (e *Engine) logMetrics() {
 		e.metrics.uploadErrors,
 		e.metrics.downloadErrors,
 	)
+}
+
+func (e *Engine) clientID() string {
+	e.idMu.RLock()
+	defer e.idMu.RUnlock()
+	return e.id
+}
+
+func (e *Engine) setClientID(id string) bool {
+	if id == "" {
+		return false
+	}
+	e.idMu.Lock()
+	defer e.idMu.Unlock()
+	if e.id != "" {
+		return false
+	}
+	e.id = id
+	return true
+}
+
+func (e *Engine) selectBackendForSession(s *Session) (*storage.BackendHandle, error) {
+	clientID := s.ClientID
+	if clientID == "" {
+		clientID = e.clientID()
+	}
+	return e.pool.Select(clientID + ":" + s.ID)
+}
+
+func (e *Engine) ensureStreamContext(ctx context.Context) bool {
+	if e.clientID() == "" && !e.discoverClientID(ctx) {
+		return false
+	}
+	e.ensureStreamOffsetsLoaded(ctx)
+	return e.clientID() != ""
+}
+
+func (e *Engine) discoverClientID(ctx context.Context) bool {
+	seen := make(map[string]struct{})
+	for _, backend := range e.pool.Backends() {
+		names, err := backend.Backend.ListQuery(ctx, "stream-"+string(e.peerDir)+"-")
+		if err != nil {
+			log.Printf("stream discovery error backend=%s: %v", backend.Name, err)
+			continue
+		}
+		for _, name := range names {
+			dir, clientID, ok := parseStreamFilename(name)
+			if !ok || dir != e.peerDir || clientID == "" {
+				continue
+			}
+			seen[clientID] = struct{}{}
+		}
+	}
+	if len(seen) != 1 {
+		if len(seen) > 1 {
+			log.Printf("multiple client stream IDs discovered; set client_id explicitly on this side")
+		}
+		return false
+	}
+	for clientID := range seen {
+		if e.setClientID(clientID) {
+			log.Printf("discovered client_id=%s from %s streams", clientID, e.peerDir)
+		}
+		return true
+	}
+	return false
+}
+
+func (e *Engine) ensureStreamOffsetsLoaded(ctx context.Context) {
+	clientID := e.clientID()
+	if clientID == "" {
+		return
+	}
+
+	e.streamOffsetMu.Lock()
+	if e.streamOffsetsLoaded {
+		e.streamOffsetMu.Unlock()
+		return
+	}
+	e.streamOffsetMu.Unlock()
+
+	for _, backend := range e.pool.Backends() {
+		offset, err := loadOffsetFromDrive(backend.Backend, e.peerDir, clientID, ctx)
+		if err != nil {
+			continue
+		}
+		e.setStreamOffset(backend.Name, offset.Offset, false)
+		log.Printf("loaded stream offset backend=%s dir=%s offset=%d", backend.Name, e.peerDir, offset.Offset)
+	}
+
+	e.streamOffsetMu.Lock()
+	e.streamOffsetsLoaded = true
+	e.streamOffsetMu.Unlock()
+}
+
+func (e *Engine) streamOffset(backendName string) int64 {
+	e.streamOffsetMu.Lock()
+	defer e.streamOffsetMu.Unlock()
+	return e.streamOffsets[backendName]
+}
+
+func (e *Engine) setStreamOffset(backendName string, offset int64, dirty bool) {
+	e.streamOffsetMu.Lock()
+	e.streamOffsets[backendName] = offset
+	if dirty {
+		e.streamOffsetDirty[backendName] = true
+	}
+	e.streamOffsetMu.Unlock()
+}
+
+func (e *Engine) flushStreamOffsets(ctx context.Context) {
+	clientID := e.clientID()
+	if clientID == "" {
+		return
+	}
+
+	for _, backend := range e.pool.Backends() {
+		e.streamOffsetMu.Lock()
+		dirty := e.streamOffsetDirty[backend.Name]
+		offset := e.streamOffsets[backend.Name]
+		if dirty {
+			e.streamOffsetDirty[backend.Name] = false
+		}
+		e.streamOffsetMu.Unlock()
+		if !dirty {
+			continue
+		}
+
+		off := streamOffset{
+			Dir:            e.peerDir,
+			ClientID:       clientID,
+			Offset:         offset,
+			LastUploadedMs: time.Now().UnixMilli(),
+		}
+		if err := saveOffsetToDrive(off, backend.Backend, ctx); err != nil {
+			log.Printf("failed to save offset backend=%s: %v", backend.Name, err)
+			e.streamOffsetMu.Lock()
+			e.streamOffsetDirty[backend.Name] = true
+			e.streamOffsetMu.Unlock()
+			continue
+		}
+		log.Printf("saved stream offset backend=%s dir=%s offset=%d", backend.Name, e.peerDir, offset)
+	}
 }

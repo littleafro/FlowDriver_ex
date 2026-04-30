@@ -36,7 +36,7 @@ func main() {
 		log.Fatalf("failed to initialize backend pool: %v", err)
 	}
 
-	engine := transport.NewEngineWithPool(pool, false, "", app.BuildEngineOptions(appCfg))
+	engine := transport.NewEngineWithPool(pool, false, appCfg.ClientID, app.BuildEngineOptions(appCfg))
 
 	allowCIDRs, err := netutil.ParseCIDRs(appCfg.AllowCIDRs)
 	if err != nil {

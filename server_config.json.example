@@ -1,5 +1,6 @@
 {
   "storage_type": "google",
+  "client_id": "iran-vps-01",
   "server_id": "foreign-vps-01",
   "tunnel_id": "main",
   "data_dir": "./data-server",

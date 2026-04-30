@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestClientStreamAppendAndFlush(t *testing.T) {
 
 	engine.doUpload(context.Background())
 
-	if !backend.HasFile("stream-req-"+safeID("c1")+".bin") {
+	if !backend.HasFile("stream-req-" + safeID("c1") + ".bin") {
 		t.Fatalf("expected stream file on backend")
 	}
 
@@ -71,7 +72,7 @@ func TestClientStreamBatchesMultipleSessions(t *testing.T) {
 
 	engine.doUpload(context.Background())
 
-	if !backend.HasFile("stream-req-"+safeID("c1")+".bin") {
+	if !backend.HasFile("stream-req-" + safeID("c1") + ".bin") {
 		t.Fatalf("expected stream file on backend")
 	}
 }
@@ -130,9 +131,7 @@ func TestServerOffsetPersistsAcrossPolls(t *testing.T) {
 	serverEngine.doPoll(context.Background())
 	time.Sleep(50 * time.Millisecond)
 
-	serverEngine.serverOffsetMu.Lock()
-	offset := serverEngine.serverOffset
-	serverEngine.serverOffsetMu.Unlock()
+	offset := serverEngine.streamOffset("default")
 	if offset == 0 {
 		t.Fatalf("expected non-zero offset after poll")
 	}
@@ -164,7 +163,7 @@ func TestServerLoadsOffsetFromDrive(t *testing.T) {
 	_, backend := newTestEngine(t, false)
 
 	off := streamOffset{
-		Dir:            DirRes,
+		Dir:            DirReq,
 		ClientID:       "c1",
 		Offset:         100,
 		LastUploadedMs: time.Now().UnixMilli(),
@@ -172,11 +171,9 @@ func TestServerLoadsOffsetFromDrive(t *testing.T) {
 	saveOffsetToDrive(off, backend, context.Background())
 
 	engine := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), false, "c1", DefaultOptions())
-	engine.loadServerOffset(context.Background())
+	engine.ensureStreamOffsetsLoaded(context.Background())
 
-	engine.serverOffsetMu.Lock()
-	offset := engine.serverOffset
-	engine.serverOffsetMu.Unlock()
+	offset := engine.streamOffset("default")
 	if offset != 100 {
 		t.Fatalf("expected offset 100, got %d", offset)
 	}
@@ -194,7 +191,7 @@ func TestStreamFileUsesPutForUpdate(t *testing.T) {
 	engine.flushAll(true)
 	engine.doUpload(context.Background())
 
-	putCalls := backend.PutCalls("stream-req-"+safeID("c1")+".bin")
+	putCalls := backend.PutCalls("stream-req-" + safeID("c1") + ".bin")
 	if putCalls == 0 {
 		t.Fatalf("expected stream to be uploaded via Put, got %d Put calls", putCalls)
 	}
@@ -203,7 +200,7 @@ func TestStreamFileUsesPutForUpdate(t *testing.T) {
 	engine.flushAll(true)
 	engine.doUpload(context.Background())
 
-	putCalls2 := backend.PutCalls("stream-req-"+safeID("c1")+".bin")
+	putCalls2 := backend.PutCalls("stream-req-" + safeID("c1") + ".bin")
 	if putCalls2 < 2 {
 		t.Fatalf("expected at least 2 Put calls for stream updates, got %d", putCalls2)
 	}
@@ -265,7 +262,7 @@ func TestStreamUploadRetry(t *testing.T) {
 	engine.doUpload(context.Background())
 	engine.doUpload(context.Background())
 
-	if !backend.HasFile("stream-req-"+safeID("c1")+".bin") {
+	if !backend.HasFile("stream-req-" + safeID("c1") + ".bin") {
 		t.Fatalf("expected stream file on backend after retry")
 	}
 }
@@ -278,49 +275,95 @@ func TestClientFlushWithNoSessions(t *testing.T) {
 	engine.flushAll(true)
 }
 
-func TestBackendSelectionUsesFirstAvailable(t *testing.T) {
+func TestBackendSelectionPinsSessionsAcrossBackends(t *testing.T) {
 	t.Parallel()
 
 	opts := DefaultOptions()
 	opts.DataDir = t.TempDir()
-	engine := NewEngineWithPool(storage.NewBackendPool(
+	pool := storage.NewBackendPool(
 		&storage.BackendHandle{Name: "g1", Weight: 1, Backend: storage.NewFakeBackend()},
 		&storage.BackendHandle{Name: "g2", Weight: 1, Backend: storage.NewFakeBackend()},
-	), true, "c1", opts)
+	)
+	engine := NewEngineWithPool(pool, true, "c1", opts)
 
-	session := NewSession("s1")
-	session.ClientID = "c1"
-	engine.AddSession(session)
-	session.EnqueueTx([]byte("test"))
+	byBackend := make(map[string]string)
+	for i := 0; i < 1024 && len(byBackend) < 2; i++ {
+		sessionID := fmt.Sprintf("s%d", i)
+		backend, err := pool.Select("c1:" + sessionID)
+		if err != nil {
+			t.Fatalf("backend selection failed: %v", err)
+		}
+		if byBackend[backend.Name] == "" {
+			byBackend[backend.Name] = sessionID
+		}
+	}
+	if len(byBackend) != 2 {
+		t.Fatalf("expected test keys for both backends, got %v", byBackend)
+	}
+
+	for backendName, sessionID := range byBackend {
+		session := NewSession(sessionID)
+		session.ClientID = "c1"
+		engine.AddSession(session)
+		if session.BackendName != backendName {
+			t.Fatalf("session %s backend=%s, want %s", sessionID, session.BackendName, backendName)
+		}
+		session.EnqueueTx([]byte("test-" + backendName))
+	}
 	engine.flushAll(true)
 	engine.doUpload(context.Background())
 
 	backends := engine.pool.Backends()
-	if len(backends) == 0 {
-		t.Fatalf("no backends available")
+	if len(backends) != 2 {
+		t.Fatalf("expected 2 backends, got %d", len(backends))
 	}
-	fakeBackend, ok := backends[0].Backend.(*storage.FakeBackend)
-	if !ok {
-		t.Fatalf("expected FakeBackend")
-	}
-	if !fakeBackend.HasFile("stream-req-"+safeID("c1")+".bin") {
-		t.Fatalf("expected stream file on first backend")
+	for _, handle := range backends {
+		fakeBackend, ok := handle.Backend.(*storage.FakeBackend)
+		if !ok {
+			t.Fatalf("expected FakeBackend")
+		}
+		if !fakeBackend.HasFile("stream-req-" + safeID("c1") + ".bin") {
+			t.Fatalf("expected stream file on backend %s", handle.Name)
+		}
 	}
 }
 
-func TestServerOffsetFlushLoop(t *testing.T) {
+func TestServerDiscoversClientIDFromStreams(t *testing.T) {
+	t.Parallel()
+
+	clientEngine, backend := newTestEngine(t, true)
+	clientSession := NewSession("s1")
+	clientSession.ClientID = "c1"
+	clientSession.TargetAddr = "1.1.1.1:443"
+	clientEngine.AddSession(clientSession)
+	clientSession.EnqueueTx([]byte("hello"))
+	clientEngine.flushAll(true)
+	clientEngine.doUpload(context.Background())
+
+	serverEngine := NewEngineWithPool(storage.NewSingleBackendPool("g1", backend), false, "", DefaultOptions())
+	serverEngine.doPoll(context.Background())
+
+	if got := serverEngine.clientID(); got != "c1" {
+		t.Fatalf("clientID = %q, want c1", got)
+	}
+	session := serverEngine.GetSession("s1")
+	if session == nil {
+		t.Fatalf("expected session to be created")
+	}
+	if session.BackendName != "g1" {
+		t.Fatalf("backend = %q, want g1", session.BackendName)
+	}
+}
+
+func TestStreamOffsetFlushLoop(t *testing.T) {
 	t.Parallel()
 
 	engine, backend := newTestEngine(t, false)
+	engine.setStreamOffset("default", 500, true)
 
-	engine.serverOffsetMu.Lock()
-	engine.serverOffset = 500
-	engine.serverOffsetDirty = true
-	engine.serverOffsetMu.Unlock()
+	engine.flushStreamOffsets(context.Background())
 
-	engine.flushServerOffset(context.Background())
-
-	rc, err := backend.Download(context.Background(), "offset-res-"+safeID("c1")+".json")
+	rc, err := backend.Download(context.Background(), "offset-req-"+safeID("c1")+".json")
 	if err != nil {
 		t.Fatalf("expected offset file to be saved: %v", err)
 	}
