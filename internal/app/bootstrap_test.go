@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/NullLatency/flow-driver/internal/config"
@@ -61,5 +62,19 @@ func TestGoogleTokenURLAllowsExplicitOverride(t *testing.T) {
 	tokenURL := googleTokenURL(cfg, backends[0], tokenTransport)
 	if tokenURL != "https://example.invalid/custom-token" {
 		t.Fatalf("expected explicit token URL override, got %q", tokenURL)
+	}
+}
+
+func TestTrackFolderAssignmentRejectsDuplicates(t *testing.T) {
+	foldersByID := map[string]string{
+		"shared-folder": "g1",
+	}
+
+	err := trackFolderAssignment(foldersByID, "g2", "shared-folder")
+	if err == nil {
+		t.Fatalf("expected duplicate folder_id error")
+	}
+	if !strings.Contains(err.Error(), "reuses folder_id") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

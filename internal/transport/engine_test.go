@@ -157,6 +157,69 @@ func TestServerOffsetPersistsAcrossPolls(t *testing.T) {
 	}
 }
 
+func TestServerResetsOffsetWhenStreamShrinks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// Initial client uploads enough data so the server records a large offset.
+	clientEngine, backend := newTestEngine(t, true)
+	clientSession := NewSession("s1")
+	clientSession.ClientID = "c1"
+	clientSession.TargetAddr = "1.1.1.1:443"
+	clientEngine.AddSession(clientSession)
+	for i := 0; i < 64; i++ {
+		clientSession.EnqueueTx([]byte("payload-payload-payload-payload"))
+	}
+	clientEngine.flushAll(true)
+	clientEngine.doUpload(ctx)
+
+	serverEngine := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), false, "c1", DefaultOptions())
+	serverEngine.doPoll(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	initialOffset := serverEngine.streamOffset("default")
+	if initialOffset == 0 {
+		t.Fatalf("expected non-zero initial offset")
+	}
+
+	// Simulate client restart with a new local data dir, producing a much smaller stream file.
+	restartedOpts := DefaultOptions()
+	restartedOpts.DataDir = t.TempDir()
+	restartedClient := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), true, "c1", restartedOpts)
+	restartedSession := NewSession("s2")
+	restartedSession.ClientID = "c1"
+	restartedSession.TargetAddr = "1.1.1.1:443"
+	restartedClient.AddSession(restartedSession)
+	restartedSession.EnqueueTx([]byte("hi"))
+	restartedClient.flushAll(true)
+	restartedClient.doUpload(ctx)
+
+	serverEngine.doPoll(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	updatedOffset := serverEngine.streamOffset("default")
+	if updatedOffset == 0 {
+		t.Fatalf("expected offset to remain non-zero after shrink handling")
+	}
+	if updatedOffset >= initialOffset {
+		t.Fatalf("expected offset to reset after shrink: initial=%d updated=%d", initialOffset, updatedOffset)
+	}
+
+	session := serverEngine.GetSession("s2")
+	if session == nil {
+		t.Fatalf("expected restarted session to be created")
+	}
+	select {
+	case got := <-session.RxChan:
+		if string(got) != "hi" {
+			t.Fatalf("unexpected payload %q", got)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("timed out waiting for restarted stream payload")
+	}
+}
+
 func TestServerLoadsOffsetFromDrive(t *testing.T) {
 	t.Parallel()
 

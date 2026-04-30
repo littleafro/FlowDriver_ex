@@ -349,7 +349,7 @@ func (e *Engine) doPoll(ctx context.Context) {
 	for _, backend := range e.pool.Backends() {
 		data, err := e.stream.DownloadStream(e.peerDir, clientID, backend.Backend, ctx)
 		if err != nil {
-			if !isNotFoundErr(err) {
+			if !storage.IsNotFoundError(err) {
 				log.Printf("stream download error backend=%s: %v", backend.Name, err)
 				e.metrics.mu.Lock()
 				e.metrics.downloadErrors++
@@ -359,7 +359,14 @@ func (e *Engine) doPoll(ctx context.Context) {
 		}
 
 		offset := e.streamOffset(backend.Name)
-		if int64(len(data)) <= offset {
+		streamLen := int64(len(data))
+		if streamLen < offset {
+			log.Printf("stream regressed backend=%s previous_offset=%d current_size=%d; resetting offset to 0",
+				backend.Name, offset, streamLen)
+			offset = 0
+			e.setStreamOffset(backend.Name, 0, true)
+		}
+		if streamLen <= offset {
 			continue
 		}
 		newData := data[offset:]
@@ -459,14 +466,6 @@ func envelopeBinaryLen(data []byte) int {
 	payloadLen := int(binary.BigEndian.Uint32(data[off : off+4]))
 	off += 4 + payloadLen
 	return off
-}
-
-func isNotFoundErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return len(s) > 0 && (s == "file not found: " || len(s) > 100)
 }
 
 func (e *Engine) markClosedSession(id string) {

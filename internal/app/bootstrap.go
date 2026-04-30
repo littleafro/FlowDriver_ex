@@ -71,6 +71,7 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 
 	handles := make([]*storage.BackendHandle, 0, len(backends))
 	updatedConfig := false
+	foldersByID := make(map[string]string, len(backends))
 
 	for i, backendCfg := range backends {
 		creds := backendCfg.CredentialsPath
@@ -143,6 +144,10 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 			return nil, fmt.Errorf("backend %s folder validation failed: %w", backendCfg.Name, err)
 		}
 
+		if err := trackFolderAssignment(foldersByID, backendCfg.Name, backends[i].FolderID); err != nil {
+			return nil, err
+		}
+
 		log.Printf("backend %s ready folder=%s weight=%d", backendCfg.Name, backends[i].FolderID, backendCfg.Weight)
 		handles = append(handles, handle)
 	}
@@ -154,6 +159,17 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 	}
 
 	return storage.NewBackendPool(handles...), nil
+}
+
+func trackFolderAssignment(foldersByID map[string]string, backendName, folderID string) error {
+	if folderID == "" {
+		return nil
+	}
+	if other, exists := foldersByID[folderID]; exists {
+		return fmt.Errorf("backend %s reuses folder_id %q already assigned to backend %s; each enabled backend must use a distinct Drive folder", backendName, folderID, other)
+	}
+	foldersByID[folderID] = backendName
+	return nil
 }
 
 func googleTransports(cfg *config.AppConfig, backendCfg config.GoogleBackendConfig) (httpclient.TransportConfig, httpclient.TransportConfig) {
