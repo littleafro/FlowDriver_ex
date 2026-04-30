@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -330,6 +332,40 @@ func TestStreamUploadRetry(t *testing.T) {
 	}
 }
 
+func TestUploadSkipsUnchangedStreamData(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+
+	session := NewSession("s1")
+	session.ClientID = "c1"
+	engine.AddSession(session)
+	session.EnqueueTx([]byte("hello"))
+	engine.flushAll(true)
+
+	engine.doUpload(context.Background())
+	filename := "stream-req-" + safeID("c1") + ".bin"
+	firstPutCalls := backend.PutCalls(filename)
+	if firstPutCalls == 0 {
+		t.Fatalf("expected initial stream upload")
+	}
+
+	engine.doUpload(context.Background())
+	secondPutCalls := backend.PutCalls(filename)
+	if secondPutCalls != firstPutCalls {
+		t.Fatalf("expected unchanged stream to skip upload; put calls %d -> %d", firstPutCalls, secondPutCalls)
+	}
+
+	session.EnqueueTx([]byte("world"))
+	engine.flushAll(true)
+	engine.doUpload(context.Background())
+
+	thirdPutCalls := backend.PutCalls(filename)
+	if thirdPutCalls <= secondPutCalls {
+		t.Fatalf("expected changed stream to upload; put calls %d -> %d", secondPutCalls, thirdPutCalls)
+	}
+}
+
 func TestClientFlushWithNoSessions(t *testing.T) {
 	t.Parallel()
 
@@ -438,5 +474,45 @@ func TestStreamOffsetFlushLoop(t *testing.T) {
 	}
 	if off.Offset != 500 {
 		t.Fatalf("expected offset 500, got %d", off.Offset)
+	}
+}
+
+func TestHeartbeatRespectsConfiguredInterval(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+	engine.opts.HeartbeatInterval = 100 * time.Millisecond
+
+	session := NewSession("s-heartbeat")
+	session.ClientID = "c1"
+	session.TargetAddr = "example.com:443"
+	engine.AddSession(session)
+
+	engine.flushAll(false)
+
+	streamPath := filepath.Join(engine.opts.DataDir, "streams", "default", string(DirReq), "stream.bin")
+	initial, err := os.Stat(streamPath)
+	if err != nil {
+		t.Fatalf("stat stream file: %v", err)
+	}
+
+	// Within the heartbeat interval we should not append heartbeat envelopes.
+	engine.flushAll(false)
+	second, err := os.Stat(streamPath)
+	if err != nil {
+		t.Fatalf("stat stream file: %v", err)
+	}
+	if second.Size() != initial.Size() {
+		t.Fatalf("unexpected heartbeat before interval: initial=%d second=%d", initial.Size(), second.Size())
+	}
+
+	time.Sleep(130 * time.Millisecond)
+	engine.flushAll(false)
+	third, err := os.Stat(streamPath)
+	if err != nil {
+		t.Fatalf("stat stream file: %v", err)
+	}
+	if third.Size() <= second.Size() {
+		t.Fatalf("expected heartbeat after interval: second=%d third=%d", second.Size(), third.Size())
 	}
 }

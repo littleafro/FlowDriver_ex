@@ -169,7 +169,7 @@ func (s *Session) prepareEnvelopeLocked(now time.Time, segmentBytes, maxSegmentB
 		buffered = 0
 	}
 	shouldSendOpen := !openSent
-	shouldHeartbeat := allowHeartbeat && !s.closeQueued && buffered == 0 && now.Sub(s.lastHeartbeatTx) > 0
+	shouldHeartbeat := allowHeartbeat && !s.closeQueued && buffered == 0
 
 	if !shouldSendOpen && !force && buffered < segmentBytes && !s.closeQueued && !shouldHeartbeat {
 		return nil, nil

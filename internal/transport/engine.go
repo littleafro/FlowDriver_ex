@@ -123,7 +123,7 @@ func (e *Engine) AddSession(s *Session) {
 	if s == nil {
 		return
 	}
-	s.Configure(e.opts.MaxTxBufferBytesPerSession, e.opts.MaxOutOfOrderSegments, int(e.opts.FlushRate.Milliseconds()), e.notifyFlush, e.notifyForceFlush)
+	s.Configure(e.opts.MaxTxBufferBytesPerSession, e.opts.MaxOutOfOrderSegments, e.opts.SegmentBytes, e.notifyFlush, e.notifyForceFlush)
 	if s.ClientID == "" {
 		s.ClientID = e.clientID()
 	}
@@ -218,7 +218,11 @@ func (e *Engine) flushAll(force bool) {
 			}
 			s.BackendName = backend.Name
 		}
-		envs, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force, e.opts.HeartbeatInterval > 0)
+		allowHeartbeat := false
+		if e.opts.HeartbeatInterval > 0 {
+			allowHeartbeat = s.CanHeartbeat(now, e.opts.HeartbeatInterval)
+		}
+		envs, err := s.PrepareEnvelopeBatch(now, e.opts.SegmentBytes, e.opts.MaxSegmentBytes, e.opts.MaxMuxSegments, force, allowHeartbeat)
 		if err != nil {
 			log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
 			continue

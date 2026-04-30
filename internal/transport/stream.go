@@ -25,8 +25,10 @@ type streamManager struct {
 }
 
 type streamState struct {
-	dataPath string
-	offset   int64
+	mu             sync.Mutex
+	dataPath       string
+	offset         int64
+	uploadedOffset int64
 }
 
 type streamKey struct {
@@ -51,8 +53,9 @@ func (m *streamManager) getOrCreate(d Direction, clientID, backendName string) *
 		dir := filepath.Join(m.baseDir, "streams", backendName, string(d))
 		_ = os.MkdirAll(dir, 0755)
 		s = &streamState{
-			dataPath: filepath.Join(dir, "stream.bin"),
-			offset:   0,
+			dataPath:       filepath.Join(dir, "stream.bin"),
+			offset:         0,
+			uploadedOffset: -1,
 		}
 		m.streams[key] = s
 	}
@@ -104,7 +107,9 @@ func (m *streamManager) AppendForBackend(d Direction, clientID, backendName stri
 	}
 	f.Close()
 
+	s.mu.Lock()
 	s.offset = pos + int64(len(data))
+	s.mu.Unlock()
 	return pos, nil
 }
 
@@ -117,11 +122,25 @@ func (m *streamManager) Flush(d Direction, clientID string, backend storage.Back
 func (m *streamManager) FlushForBackend(d Direction, clientID, backendName string, backend storage.Backend, ctx context.Context) (int64, error) {
 	s := m.getOrCreate(d, clientID, backendName)
 
-	data, err := os.ReadFile(s.dataPath)
+	info, err := os.Stat(s.dataPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+		return 0, err
+	}
+	if info.Size() == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	if s.uploadedOffset == info.Size() {
+		s.mu.Unlock()
+		return 0, nil
+	}
+	s.mu.Unlock()
+
+	data, err := os.ReadFile(s.dataPath)
+	if err != nil {
 		return 0, err
 	}
 	if len(data) == 0 {
@@ -133,8 +152,12 @@ func (m *streamManager) FlushForBackend(d Direction, clientID, backendName strin
 		return 0, err
 	}
 
-	s.offset = int64(len(data))
-	return int64(len(data)), nil
+	size := int64(len(data))
+	s.mu.Lock()
+	s.offset = size
+	s.uploadedOffset = size
+	s.mu.Unlock()
+	return size, nil
 }
 
 // DownloadStream downloads the entire stream file from the backend.

@@ -16,3 +16,4 @@ go1.26/
 /client_logs.txt
 /server_logs.txt
 /curl_logs.txt
+creds/

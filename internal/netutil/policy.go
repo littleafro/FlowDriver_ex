@@ -5,7 +5,14 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"time"
+)
+
+const (
+	maxDialCandidates        = 6
+	minPerAttemptDialTimeout = 2 * time.Second
+	maxPerAttemptDialTimeout = 5 * time.Second
 )
 
 type DialPolicy struct {
@@ -86,16 +93,58 @@ func (p *DialPolicy) DialContext(ctx context.Context, targetAddr string) (net.Co
 		}
 	}
 	slices.Sort(candidates)
-	for _, candidate := range candidates {
-		conn, err := dialer.DialContext(ctx, "tcp", candidate)
-		if err == nil {
-			return conn, nil
-		}
-	}
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no allowed IPs for %s", targetAddr)
 	}
-	return nil, fmt.Errorf("failed to dial allowed IPs for %s", targetAddr)
+	totalCandidates := len(candidates)
+	if totalCandidates > maxDialCandidates {
+		candidates = candidates[:maxDialCandidates]
+	}
+	perAttempt := dialAttemptTimeout(p.DialTimeout, len(candidates))
+	errs := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		attemptCtx := ctx
+		cancel := func() {}
+		if perAttempt > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, perAttempt)
+		}
+		conn, err := dialer.DialContext(attemptCtx, "tcp", candidate)
+		cancel()
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", candidate, err))
+	}
+	return nil, fmt.Errorf("failed to dial allowed IPs for %s (attempted=%d/%d per_attempt_timeout=%s): %s",
+		targetAddr, len(candidates), totalCandidates, perAttempt, summarizeDialErrors(errs))
+}
+
+func dialAttemptTimeout(total time.Duration, attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	if total <= 0 {
+		total = 30 * time.Second
+	}
+	perAttempt := total / time.Duration(attempts)
+	if perAttempt < minPerAttemptDialTimeout {
+		perAttempt = minPerAttemptDialTimeout
+	}
+	if perAttempt > maxPerAttemptDialTimeout {
+		perAttempt = maxPerAttemptDialTimeout
+	}
+	return perAttempt
+}
+
+func summarizeDialErrors(errs []string) string {
+	if len(errs) == 0 {
+		return "no dial attempts recorded"
+	}
+	const preview = 3
+	if len(errs) <= preview {
+		return strings.Join(errs, "; ")
+	}
+	return strings.Join(errs[:preview], "; ") + fmt.Sprintf("; ... (%d more)", len(errs)-preview)
 }
 
 func containsIP(networks []*net.IPNet, ip net.IP) bool {
