@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [kir]
     tags: ['v*']
   workflow_dispatch:
     inputs:
