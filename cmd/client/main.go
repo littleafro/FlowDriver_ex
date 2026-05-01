@@ -17,6 +17,7 @@ import (
 	"github.com/NullLatency/flow-driver/internal/app"
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/netutil"
+	"github.com/NullLatency/flow-driver/internal/storage"
 	"github.com/NullLatency/flow-driver/internal/transport"
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/statute"
@@ -36,8 +37,10 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 
 func main() {
 	var configPath, gcPath string
+	var adaptive bool
 	flag.StringVar(&configPath, "c", "config.json", "Path to config file")
 	flag.StringVar(&gcPath, "gc", "credentials.json", "Default path to Google credentials JSON")
+	flag.BoolVar(&adaptive, "adaptive", false, "Enable adaptive mode to optimize performance parameters")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -48,17 +51,37 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	pool, err := app.BuildBackendPool(ctx, appCfg, configPath, gcPath)
-	if err != nil {
-		log.Fatalf("failed to initialize backend pool: %v", err)
-	}
-
 	cid := appCfg.ClientID
 	if cid == "" {
 		cid = generateSessionID()[:8]
 	}
 
-	engine := transport.NewEngineWithPool(pool, true, cid, app.BuildEngineOptions(appCfg))
+	var (
+		pool       *storage.BackendPool
+		controller *app.AdaptiveController
+	)
+	if adaptive {
+		controller, err = app.NewAdaptiveController(appCfg.DataDir)
+		if err != nil {
+			log.Fatalf("failed to initialize adaptive controller: %v", err)
+		}
+		pool, err = app.BuildAdaptiveBackendPool(ctx, appCfg, configPath, gcPath, controller)
+	} else {
+		pool, err = app.BuildBackendPool(ctx, appCfg, configPath, gcPath)
+	}
+	if err != nil {
+		log.Fatalf("failed to initialize backend pool: %v", err)
+	}
+
+	engineOpts := app.BuildEngineOptions(appCfg)
+	if adaptive {
+		engineOpts = controller.InitialEngineOptions(appCfg)
+	}
+	engine := transport.NewEngineWithPool(pool, true, cid, engineOpts)
+	if adaptive {
+		controller.Attach(engine, pool, nil)
+		controller.Start(ctx)
+	}
 	engine.Start(ctx)
 
 	rawCIDRs, err := netutil.ParseCIDRs(appCfg.AllowedRawIPCidrs)

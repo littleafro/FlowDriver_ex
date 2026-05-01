@@ -20,12 +20,11 @@ const (
 )
 
 type RetryConfig struct {
-	MinBackoffMs                  int
-	MaxBackoffMs                  int
-	BackoffMultiplier             float64
-	JitterPercent                 int
-	MaxRetriesPerOperation        int
-	RetryForeverForPendingUploads bool
+	MinBackoffMs           int
+	MaxBackoffMs           int
+	BackoffMultiplier      float64
+	JitterPercent          int
+	MaxRetriesPerOperation int
 }
 
 type RateLimitConfig struct {

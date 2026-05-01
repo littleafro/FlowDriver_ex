@@ -84,12 +84,11 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 		fileIDs:         make(map[string]string),
 		health:          HealthHealthy,
 		retryCfg: RetryConfig{
-			MinBackoffMs:                  500,
-			MaxBackoffMs:                  30000,
-			BackoffMultiplier:             2,
-			JitterPercent:                 25,
-			MaxRetriesPerOperation:        6,
-			RetryForeverForPendingUploads: true,
+			MinBackoffMs:           500,
+			MaxBackoffMs:           30000,
+			BackoffMultiplier:      2,
+			JitterPercent:          25,
+			MaxRetriesPerOperation: 6,
 		},
 		verbose: googleVerboseFromEnv(),
 	}
@@ -414,7 +413,7 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		return err
 	}
 
-	_, err = retryOperation(ctx, b.retryCfg, "upload", b.retryCfg.RetryForeverForPendingUploads, func() (struct{}, error) {
+	_, err = retryOperation(ctx, b.retryCfg, "upload", false, func() (struct{}, error) {
 		attempts++
 		tok, err := b.getValidToken(ctx)
 		if err != nil {

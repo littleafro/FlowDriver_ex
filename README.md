@@ -1,49 +1,52 @@
 # FlowDriver
 
-FlowDriver exposes a local SOCKS5 proxy on the restricted side and carries the tunnel over Google Drive between your own VPSes and your own Google accounts. The transport in this version is no longer fire-and-forget file polling: it uses durable local spooling, per-session sequence numbers, receiver ACK state, and sender-side cleanup only after ACK.
+FlowDriver exposes a local SOCKS5 proxy on the restricted side and carries TCP sessions over Google Drive between your own VPSes and your own Google accounts.
 
-## What Changed
+The current transport is performance-first:
 
-- Outgoing tunnel segments are written to disk before upload.
-- Upload retries do not drop bytes.
-- Receiver ACKs the highest contiguous sequence per session and direction.
-- Sender keeps uploaded segments until ACK arrives, then deletes from Drive and local spool.
-- Idle timeout, cleanup, heartbeat, polling, batching, concurrency, retry, and security settings are configurable.
-- Multiple Google backends can be configured and weighted for new-session load balancing.
-- Per-backend `target_ip`, `sni`, `host_header`, separate token-endpoint transport settings, and explicit `token_url` overrides are supported.
-- The client now uses a built-in CONNECT-only SOCKS5 server, so the project builds without an external SOCKS dependency.
+- the client still serves SOCKS `CONNECT`
+- the server still dials the real upstream target
+- the carrier no longer uses a single ever-growing `stream.bin`
+- the carrier now publishes small unordered chunk files plus a tiny manifest file
+- delivery is best-effort; queued bytes can be lost on process crash or severe carrier loss
 
-## Deployment Model
+## Transport Model
 
-- Restricted VPS in Iran: run `cmd/client`
-- Foreign VPS: run `cmd/server`
-- Client exposes `127.0.0.1:1080` by default
-- Server resolves and dials the real destination
-- Google Drive is the carrier
+Each side publishes chunk batches per direction and backend:
 
-## Reliability Model
+- `manifest-req-<client>.json`
+- `manifest-res-<client>.json`
+- `chunk-req-<client>-<epoch>-<id>.bin`
+- `chunk-res-<client>-<epoch>-<id>.bin`
 
-Each session stream is segmented and named per direction:
+Steady-state polling only downloads the manifest files. The receiver then fetches only unseen chunk files referenced by the manifest.
 
-- `req-<client>-<session>-<seq>.bin`
-- `res-<client>-<session>-<seq>.bin`
-- `ack-req-<client>-<session>.json`
-- `ack-res-<client>-<session>.json`
+Chunk order does not matter. Session order still matters, because the tunnel reconstructs TCP byte streams rather than forwarding original TCP packets.
 
-Receiver behavior:
+## Adaptive Mode
 
-- validates and decodes segments
-- ignores duplicate sequence numbers
-- buffers limited out-of-order segments
-- delivers data in order
-- updates ACK state locally and uploads ACK files
+Both binaries support `--adaptive`.
 
-Sender behavior:
+When adaptive mode is enabled:
 
-- writes segments to local spool first
-- retries upload with backoff
-- polls remote ACK state
-- deletes remote and local segments only after ACK
+- tunnel identity and safety settings still come from `config.json`
+- credential paths, backend names, enabled state, and Drive folder bindings still come from `config.json`
+- manual performance/fronting/retry/rate-limit tuning from `config.json` is ignored
+- runtime tuning is chosen automatically and updated while the process is running
+- adaptive state is persisted to `data_dir/adaptive_state.json`
+
+Adaptive mode currently tunes:
+
+- poll cadence
+- flush cadence
+- chunk size and mux depth
+- upload/download/delete concurrency
+- compression mode and threshold
+- per-session buffer sizing
+- gap grace timing
+- backend preference for new sessions
+- server dial timeout and TCP keepalive
+- Google API/token transport profile selection at startup
 
 ## Build
 
@@ -55,10 +58,30 @@ Use the bundled Go toolchain:
 ./go1.26/go/bin/go build ./cmd/server
 ```
 
-To format the repo:
+## Run
+
+Server:
 
 ```bash
-rg --files -g '*.go' --glob '!go1.26/**' | xargs ./go1.26/go/bin/gofmt -w
+./server -c server_config.json.example -gc credentials-g1.json
+```
+
+Adaptive server:
+
+```bash
+./server -c server_config.json.example -gc credentials-g1.json --adaptive
+```
+
+Client:
+
+```bash
+./client -c client_config.json.example -gc credentials-g1.json
+```
+
+Adaptive client:
+
+```bash
+./client -c client_config.json.example -gc credentials-g1.json --adaptive
 ```
 
 ## Configuration
@@ -68,57 +91,46 @@ Start from:
 - `client_config.json.example`
 - `server_config.json.example`
 
-Backward compatibility is preserved for older configs that only used:
+Important persistent settings:
 
-- `storage_type`
-- `google_folder_id`
-- `local_dir`
 - `listen_addr`
 - `client_id`
-- `refresh_rate_ms`
+- `server_id`
+- `tunnel_id`
+- `data_dir`
+- backend `credentials_path`
+- backend `folder_id`
+- raw-IP and CIDR safety policy
+
+Still-supported manual tuning in non-adaptive mode:
+
+- `poll_rate_ms`
+- `active_poll_rate_ms`
+- `idle_poll_rate_ms`
 - `flush_rate_ms`
+- `segment_bytes`
+- `max_segment_bytes`
+- `max_mux_segments`
+- `max_concurrent_uploads`
+- `max_concurrent_downloads`
+- `max_concurrent_deletes`
+- `max_pending_segments_per_session`
+- `max_tx_buffer_bytes_per_session`
+- `max_out_of_order_segments`
+- `compression`
+- `compression_min_bytes`
+- `upload_interval_ms`
 - `transport`
+- `token_transport`
+- `token_url`
+- `retry`
+- `rate_limits`
 
-### Recommended Client Settings For A Restricted Iran VPS
+In adaptive mode those performance/fronting/rate-limit knobs are ignored.
 
-- `poll_rate_ms`: `750`
-- `active_poll_rate_ms`: `500`
-- `idle_poll_rate_ms`: `3000`
-- `flush_rate_ms`: `500`
-- `segment_bytes`: `65536`
-- `max_segment_bytes`: `262144`
-- `compression`: `"off"` at first
-- `warn_raw_ip`: `true`
-- `reject_raw_ip`: `false`
-- per-backend `transport.target_ip`: a known Google IP that works from your network
-- per-backend `transport.sni`: `google.com` for fronted/restricted setups
-- per-backend `transport.host_header`: `www.googleapis.com`
-- per-backend `token_url`: `https://www.googleapis.com/oauth2/v4/token` for domain-fronted/restricted setups
+## Google Backend Notes
 
-### Recommended Server Settings For A Foreign VPS
-
-- keep the same `client_id` as the client
-- keep the same `tunnel_id`
-- keep the same backend names and folder IDs
-- set `block_private_ips` to `true` unless you explicitly need RFC1918 reachability
-- tune `allow_cidrs` and `deny_cidrs` if you want egress policy enforcement
-
-## Google Account And Folder Setup
-
-1. Create one OAuth desktop client per Google account, or reuse one if it is acceptable for your setup.
-2. Download each credentials file, for example:
-   - `credentials-g1.json`
-   - `credentials-g2.json`
-3. Enable the Google Drive API in each corresponding Google Cloud project.
-4. Run the client once for each credentials file so the refresh token cache file is created next to it.
-5. Copy both the credentials JSON and the generated `.token` file to the server.
-6. Put the correct `folder_id` for each backend in both client and server configs.
-
-If `folder_id` is omitted, FlowDriver tries to find or create a folder named `Flow-Data` for that backend and writes it back to the config file.
-
-## Multiple Backend Setup
-
-Each backend entry may have:
+Each backend may define:
 
 - its own credentials file
 - its own Drive folder
@@ -126,32 +138,15 @@ Each backend entry may have:
 - its own token-endpoint transport settings
 - its own token URL
 - its own rate limits
-- its own weight
 
-New sessions are pinned by consistent weighted hashing. A single session’s ordered stream stays on one backend.
-If `client_id` is omitted on the server, it can auto-discover exactly one active client stream, but setting it explicitly is more reliable.
+If `folder_id` is omitted, FlowDriver tries to find or create a folder named `Flow-Data` for that backend and writes it back to the config file.
 
-## Rate Limit Tuning
+## SOCKS Notes
 
-Useful knobs:
-
-- `max_reads_per_second`
-- `max_writes_per_second`
-- `max_deletes_per_second`
-- `max_requests_per_minute`
-- `max_daily_upload_bytes`
-- `max_daily_download_bytes`
-- `stop_when_budget_exhausted`
-
-Start conservatively. If Drive responds with `403` or `429`, lower polling and flush aggressiveness before raising concurrency.
-
-## SOCKS And DNS Notes
-
-- The client SOCKS server supports `CONNECT`.
-- `UDP ASSOCIATE` is rejected.
-- Domain targets stay unresolved on the client side and are resolved on the server side.
-- Raw IP targets are allowed by default because some apps use hardcoded IPs.
-- Raw IPs can still be warned or rejected with:
+- SOCKS `CONNECT` is supported
+- `UDP ASSOCIATE` is rejected
+- domain targets stay unresolved on the client side and are resolved on the server side
+- raw IP targets can be warned or restricted with:
   - `warn_raw_ip`
   - `reject_raw_ip`
   - `allowed_raw_ip_cidrs`
@@ -162,90 +157,40 @@ Example:
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
 
-## Run
+## Behavioral Notes
 
-Server:
-
-```bash
-./server -c server_config.json.example -gc credentials-g1.json
-```
-
-Client:
-
-```bash
-./client -c client_config.json.example -gc credentials-g1.json
-```
-
-If you prefer output binaries in a separate directory:
-
-```bash
-./go1.26/go/bin/go build -o bin/client ./cmd/client
-./go1.26/go/bin/go build -o bin/server ./cmd/server
-./bin/server -c server_config.json.example -gc credentials-g1.json
-./bin/client -c client_config.json.example -gc credentials-g1.json
-```
+- This is not a packet tunnel like OpenVPN-over-UDP.
+- The carrier is unordered at the chunk layer, but the session layer still reorders per-session envelopes so TCP streams stay valid.
+- If a session develops a missing envelope sequence that does not heal within the adaptive grace window, only that session is closed.
+- Old chunk files from previous epochs are cleaned up by a background orphan sweeper.
 
 ## Troubleshooting
 
-### Frequent Reconnects
+### Slow Throughput
 
-- Increase `session_idle_timeout_ms`
-- Confirm heartbeats are enabled with a non-zero `heartbeat_interval_ms`
-- Check logs for repeated upload or ACK failures
+- try `--adaptive`
+- add another backend
+- verify the selected Google fronting profile actually works on your network
+
+### Frequent Session Drops
+
+- check for repeated upload/download/manifest errors in logs
+- increase manual timeouts only if you are running without `--adaptive`
+- remember that native UDP/QUIC traffic is still out of scope
 
 ### Drive `403` Or `429`
 
-- Lower `poll_rate_ms`
-- Raise `idle_poll_rate_ms`
-- Lower `max_concurrent_uploads` and `max_concurrent_downloads`
-- Reduce per-backend request rates
-- Add another backend and spread new sessions across it
+- adaptive mode will back off automatically
+- in non-adaptive mode, lower poll and upload aggressiveness
+- reduce configured request rates or add another backend
 
-### Token Refresh Failure
+### Missing Or Delayed Traffic
 
-- Verify the `.token` file matches the credentials JSON beside it
-- Check that the OAuth app is still valid and still has Drive API enabled
-- Confirm `token_transport.sni` and `token_transport.host_header` match the endpoint you are fronting
-- In restricted/fronted setups, set `token_url` to `https://www.googleapis.com/oauth2/v4/token`
-
-### TLS, SNI, Or Host Mismatch
-
-- `transport.target_ip` controls the TCP dial target
-- `transport.sni` controls the TLS server name
-- `transport.host_header` controls the HTTP Host header
-- For token refresh, use the `token_transport` equivalents
-- Keep `insecure_skip_verify` as `false` unless you have a very specific reason
-
-### Raw IP Warnings
-
-- They do not automatically mean a DNS leak
-- Apps like Telegram or custom clients may use hardcoded IPs
-- Use `allowed_raw_ip_cidrs` if you want to permit only a narrow set
-
-### Slow Throughput
-
-- Increase `segment_bytes` carefully
-- Keep `max_segment_bytes` large enough for bursty flows
-- Add another backend rather than pushing a single account harder
-- Turn on `gzip` only after the base path is already stable
-
-## Logging And Counters
-
-The runtime logs session opens/closes, backend selection, retries, ACK updates, cleanup actions, raw-IP warnings, and periodic counters including:
-
-- `active_sessions`
-- `bytes_c2s`
-- `bytes_s2c`
-- `segments_pending`
-- `segments_uploaded`
-- `segments_downloaded`
-- `retries`
-- `upload_errors`
-- `download_errors`
-- `delete_errors`
+- this transport is best-effort
+- process crashes can drop queued chunks
+- sustained chunk loss will eventually close only the affected TCP session
 
 ## Notes
 
 - This project is for your own infrastructure and accounts.
 - Keep TLS verification enabled unless you knowingly accept the risk.
-- The repo-level `go test ./...` excludes the bundled Go distribution sources by treating `go1.26/go` as a nested module.

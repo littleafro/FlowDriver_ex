@@ -28,9 +28,13 @@ type Session struct {
 	rxClosed         bool
 	closed           bool
 	openSent         bool
+	rxChanClosed     bool
+	gapSeq           uint64
+	gapSince         time.Time
 	TargetAddr       string
 	ClientID         string
 	BackendName      string
+	BackendEpoch     uint64
 	maxTxBufferBytes int
 	maxOutOfOrder    int
 	flushThreshold   int
@@ -251,34 +255,34 @@ func (s *Session) CommitEnvelope(env *Envelope, consumed int) error {
 	return nil
 }
 
-func (s *Session) ProcessRx(env *Envelope) (uint64, bool, bool, error) {
+func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 	s.mu.Lock()
 	if s.rxClosed {
-		acked, ok := s.currentAckedSeqLocked()
 		s.mu.Unlock()
-		return acked, ok, true, nil
+		return false, true, nil
 	}
 	s.lastActivity = time.Now()
 
 	if env.Seq < s.rxSeq {
-		acked, _ := s.currentAckedSeqLocked()
 		s.mu.Unlock()
-		return acked, false, false, nil
+		return false, false, nil
 	}
 	if env.Seq > s.rxSeq {
 		if _, exists := s.rxQueue[env.Seq]; !exists {
 			if len(s.rxQueue) >= s.maxOutOfOrder {
-				acked, _ := s.currentAckedSeqLocked()
 				s.mu.Unlock()
-				return acked, false, false, fmt.Errorf("session %s out-of-order buffer full", s.ID)
+				return false, false, fmt.Errorf("session %s out-of-order buffer full", s.ID)
 			}
 			copyEnv := *env
 			copyEnv.Payload = append([]byte(nil), env.Payload...)
 			s.rxQueue[env.Seq] = &copyEnv
 		}
-		acked, _ := s.currentAckedSeqLocked()
+		if s.gapSince.IsZero() || s.gapSeq != s.rxSeq {
+			s.gapSeq = s.rxSeq
+			s.gapSince = time.Now()
+		}
 		s.mu.Unlock()
-		return acked, false, false, nil
+		return false, false, nil
 	}
 
 	payloads := make([][]byte, 0, 2)
@@ -293,11 +297,11 @@ func (s *Session) ProcessRx(env *Envelope) (uint64, bool, bool, error) {
 			s.rxClosed = true
 			s.closed = true
 			closeNow = true
-		case KindHeartbeat, KindOpen, KindData:
-		default:
-			s.mu.Unlock()
-			return 0, false, false, fmt.Errorf("unknown envelope kind: %d", current.Kind)
-		}
+			case KindHeartbeat, KindOpen, KindData:
+			default:
+				s.mu.Unlock()
+				return false, false, fmt.Errorf("unknown envelope kind: %d", current.Kind)
+			}
 		if closeNow {
 			break
 		}
@@ -305,29 +309,30 @@ func (s *Session) ProcessRx(env *Envelope) (uint64, bool, bool, error) {
 		delete(s.rxQueue, s.rxSeq)
 		current = next
 	}
-	acked, _ := s.currentAckedSeqLocked()
+	if len(s.rxQueue) == 0 {
+		s.gapSeq = 0
+		s.gapSince = time.Time{}
+	} else if _, exists := s.rxQueue[s.rxSeq]; !exists {
+		s.gapSeq = s.rxSeq
+		if s.gapSince.IsZero() {
+			s.gapSince = time.Now()
+		}
+	} else {
+		s.gapSeq = 0
+		s.gapSince = time.Time{}
+	}
 	s.mu.Unlock()
 
 	for _, payload := range payloads {
-		s.RxChan <- payload
+		if !s.sendRx(payload) {
+			closeNow = true
+			break
+		}
 	}
 	if closeNow {
-		close(s.RxChan)
+		s.closeRxChan()
 	}
-	return acked, true, closeNow, nil
-}
-
-func (s *Session) currentAckedSeqLocked() (uint64, bool) {
-	if s.rxSeq == 0 {
-		return 0, false
-	}
-	return s.rxSeq - 1, true
-}
-
-func (s *Session) CurrentAckedSeq() (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.currentAckedSeqLocked()
+	return true, closeNow, nil
 }
 
 func (s *Session) LastActivity() time.Time {
@@ -363,6 +368,29 @@ func (s *Session) CanHeartbeat(now time.Time, heartbeatInterval time.Duration) b
 	return now.Sub(s.lastHeartbeatTx) >= heartbeatInterval
 }
 
+func (s *Session) GapTimedOut(now time.Time, grace time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rxClosed || grace <= 0 || s.gapSince.IsZero() {
+		return false
+	}
+	return now.Sub(s.gapSince) >= grace
+}
+
+func (s *Session) Abort() {
+	s.mu.Lock()
+	if s.rxClosed && s.rxChanClosed {
+		s.mu.Unlock()
+		return
+	}
+	s.closeQueued = true
+	s.closeSent = true
+	s.rxClosed = true
+	s.closed = true
+	s.mu.Unlock()
+	s.closeRxChan()
+}
+
 func (s *Session) ReadyForTeardown(now time.Time, grace time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -377,4 +405,25 @@ func (s *Session) ReadyForTeardown(now time.Time, grace time.Duration) bool {
 		return now.Sub(s.lastActivity) >= grace
 	}
 	return false
+}
+
+func (s *Session) closeRxChan() {
+	s.mu.Lock()
+	if s.rxChanClosed {
+		s.mu.Unlock()
+		return
+	}
+	s.rxChanClosed = true
+	close(s.RxChan)
+	s.mu.Unlock()
+}
+
+func (s *Session) sendRx(payload []byte) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	s.RxChan <- payload
+	return true
 }

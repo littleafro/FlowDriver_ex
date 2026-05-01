@@ -6,6 +6,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type DialPolicy struct {
 	BlockPrivateIPs bool
 	DialTimeout     time.Duration
 	KeepAlive       time.Duration
+	mu              sync.RWMutex
 }
 
 func ParseCIDRs(values []string) ([]*net.IPNet, error) {
@@ -70,9 +72,10 @@ func (p *DialPolicy) DialContext(ctx context.Context, targetAddr string) (net.Co
 	if err != nil {
 		return nil, err
 	}
+	dialTimeout, keepAlive := p.timing()
 	dialer := &net.Dialer{
-		Timeout:   p.DialTimeout,
-		KeepAlive: p.KeepAlive,
+		Timeout:   dialTimeout,
+		KeepAlive: keepAlive,
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
@@ -100,7 +103,7 @@ func (p *DialPolicy) DialContext(ctx context.Context, targetAddr string) (net.Co
 	if totalCandidates > maxDialCandidates {
 		candidates = candidates[:maxDialCandidates]
 	}
-	perAttempt := dialAttemptTimeout(p.DialTimeout, len(candidates))
+	perAttempt := dialAttemptTimeout(dialTimeout, len(candidates))
 	errs := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		attemptCtx := ctx
@@ -117,6 +120,23 @@ func (p *DialPolicy) DialContext(ctx context.Context, targetAddr string) (net.Co
 	}
 	return nil, fmt.Errorf("failed to dial allowed IPs for %s (attempted=%d/%d per_attempt_timeout=%s): %s",
 		targetAddr, len(candidates), totalCandidates, perAttempt, summarizeDialErrors(errs))
+}
+
+func (p *DialPolicy) SetTiming(dialTimeout, keepAlive time.Duration) {
+	p.mu.Lock()
+	if dialTimeout > 0 {
+		p.DialTimeout = dialTimeout
+	}
+	if keepAlive > 0 {
+		p.KeepAlive = keepAlive
+	}
+	p.mu.Unlock()
+}
+
+func (p *DialPolicy) timing() (time.Duration, time.Duration) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.DialTimeout, p.KeepAlive
 }
 
 func dialAttemptTimeout(total time.Duration, attempts int) time.Duration {

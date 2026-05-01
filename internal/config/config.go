@@ -15,8 +15,6 @@ const (
 	DefaultDataDir                       = "./data"
 	DefaultTunnelID                      = "main"
 	DefaultSessionIdleTimeoutMs          = 300000
-	DefaultStaleUnackedFileTTLms         = 1800000
-	DefaultTombstoneTTLms                = 300000
 	DefaultCleanupIntervalMs             = 30000
 	DefaultHeartbeatIntervalMs           = 30000
 	DefaultPollRateMs                    = 750
@@ -32,8 +30,6 @@ const (
 	DefaultMaxPendingSegmentsPerSession  = 256
 	DefaultMaxTxBufferBytesPerSession    = 4 * 1024 * 1024
 	DefaultMaxOutOfOrderSegments         = 64
-	DefaultAckEverySegments              = 8
-	DefaultAckIntervalMs                 = 1000
 	DefaultCompression                   = "off"
 	DefaultCompressionMinBytes           = 4096
 	DefaultDialTimeoutMs                 = 30000
@@ -45,19 +41,17 @@ const (
 	DefaultRetryBackoffMultiplier        = 2.0
 	DefaultRetryJitterPercent            = 25
 	DefaultRetryMaxRetriesPerOperation   = 6
-	DefaultRetryForeverForPendingUploads = true
 	DefaultBackendWeight                 = 1
 	DefaultUploadIntervalMs              = 250
 	DefaultRateLimitScale                = 1.0
 )
 
 type RetryConfig struct {
-	MinBackoffMs                  int     `json:"min_backoff_ms,omitempty"`
-	MaxBackoffMs                  int     `json:"max_backoff_ms,omitempty"`
-	BackoffMultiplier             float64 `json:"backoff_multiplier,omitempty"`
-	JitterPercent                 int     `json:"jitter_percent,omitempty"`
-	MaxRetriesPerOperation        int     `json:"max_retries_per_operation,omitempty"`
-	RetryForeverForPendingUploads *bool   `json:"retry_forever_for_pending_uploads,omitempty"`
+	MinBackoffMs           int     `json:"min_backoff_ms,omitempty"`
+	MaxBackoffMs           int     `json:"max_backoff_ms,omitempty"`
+	BackoffMultiplier      float64 `json:"backoff_multiplier,omitempty"`
+	JitterPercent          int     `json:"jitter_percent,omitempty"`
+	MaxRetriesPerOperation int     `json:"max_retries_per_operation,omitempty"`
 }
 
 type RateLimitConfig struct {
@@ -72,12 +66,8 @@ type RateLimitConfig struct {
 
 type ReliabilityConfig struct {
 	SessionIdleTimeoutMs  int `json:"session_idle_timeout_ms,omitempty"`
-	StaleUnackedFileTTLms int `json:"stale_unacked_file_ttl_ms,omitempty"`
-	TombstoneTTLms        int `json:"tombstone_ttl_ms,omitempty"`
 	CleanupIntervalMs     int `json:"cleanup_interval_ms,omitempty"`
 	HeartbeatIntervalMs   int `json:"heartbeat_interval_ms,omitempty"`
-	AckEverySegments      int `json:"ack_every_segments,omitempty"`
-	AckIntervalMs         int `json:"ack_interval_ms,omitempty"`
 	MaxOutOfOrderSegments int `json:"max_out_of_order_segments,omitempty"`
 }
 
@@ -137,16 +127,14 @@ type AppConfig struct {
 	FlushRateMs   int `json:"flush_rate_ms,omitempty"`
 	PollRateMs    int `json:"poll_rate_ms,omitempty"`
 
-	SessionIdleTimeoutMs  int `json:"session_idle_timeout_ms,omitempty"`
-	StaleUnackedFileTTLms int `json:"stale_unacked_file_ttl_ms,omitempty"`
-	TombstoneTTLms        int `json:"tombstone_ttl_ms,omitempty"`
-	CleanupIntervalMs     int `json:"cleanup_interval_ms,omitempty"`
-	HeartbeatIntervalMs   int `json:"heartbeat_interval_ms,omitempty"`
-	ActivePollRateMs      int `json:"active_poll_rate_ms,omitempty"`
-	IdlePollRateMs        int `json:"idle_poll_rate_ms,omitempty"`
-	SegmentBytes          int `json:"segment_bytes,omitempty"`
-	MaxSegmentBytes       int `json:"max_segment_bytes,omitempty"`
-	MaxMuxSegments        int `json:"max_mux_segments,omitempty"`
+	SessionIdleTimeoutMs int `json:"session_idle_timeout_ms,omitempty"`
+	CleanupIntervalMs    int `json:"cleanup_interval_ms,omitempty"`
+	HeartbeatIntervalMs  int `json:"heartbeat_interval_ms,omitempty"`
+	ActivePollRateMs     int `json:"active_poll_rate_ms,omitempty"`
+	IdlePollRateMs       int `json:"idle_poll_rate_ms,omitempty"`
+	SegmentBytes         int `json:"segment_bytes,omitempty"`
+	MaxSegmentBytes      int `json:"max_segment_bytes,omitempty"`
+	MaxMuxSegments       int `json:"max_mux_segments,omitempty"`
 
 	MaxConcurrentUploads         int `json:"max_concurrent_uploads,omitempty"`
 	MaxConcurrentDownloads       int `json:"max_concurrent_downloads,omitempty"`
@@ -154,8 +142,6 @@ type AppConfig struct {
 	MaxPendingSegmentsPerSession int `json:"max_pending_segments_per_session,omitempty"`
 	MaxTxBufferBytesPerSession   int `json:"max_tx_buffer_bytes_per_session,omitempty"`
 	MaxOutOfOrderSegments        int `json:"max_out_of_order_segments,omitempty"`
-	AckEverySegments             int `json:"ack_every_segments,omitempty"`
-	AckIntervalMs                int `json:"ack_interval_ms,omitempty"`
 
 	Compression         string `json:"compression,omitempty"`
 	CompressionMinBytes int    `json:"compression_min_bytes,omitempty"`
@@ -245,23 +231,11 @@ func (c *AppConfig) Normalize() {
 	if c.SessionIdleTimeoutMs == 0 && c.Reliability.SessionIdleTimeoutMs > 0 {
 		c.SessionIdleTimeoutMs = c.Reliability.SessionIdleTimeoutMs
 	}
-	if c.StaleUnackedFileTTLms == 0 && c.Reliability.StaleUnackedFileTTLms > 0 {
-		c.StaleUnackedFileTTLms = c.Reliability.StaleUnackedFileTTLms
-	}
-	if c.TombstoneTTLms == 0 && c.Reliability.TombstoneTTLms > 0 {
-		c.TombstoneTTLms = c.Reliability.TombstoneTTLms
-	}
 	if c.CleanupIntervalMs == 0 && c.Reliability.CleanupIntervalMs > 0 {
 		c.CleanupIntervalMs = c.Reliability.CleanupIntervalMs
 	}
 	if c.HeartbeatIntervalMs == 0 && c.Reliability.HeartbeatIntervalMs > 0 {
 		c.HeartbeatIntervalMs = c.Reliability.HeartbeatIntervalMs
-	}
-	if c.AckEverySegments == 0 && c.Reliability.AckEverySegments > 0 {
-		c.AckEverySegments = c.Reliability.AckEverySegments
-	}
-	if c.AckIntervalMs == 0 && c.Reliability.AckIntervalMs > 0 {
-		c.AckIntervalMs = c.Reliability.AckIntervalMs
 	}
 	if c.MaxOutOfOrderSegments == 0 && c.Reliability.MaxOutOfOrderSegments > 0 {
 		c.MaxOutOfOrderSegments = c.Reliability.MaxOutOfOrderSegments
@@ -332,12 +306,6 @@ func (c *AppConfig) Normalize() {
 	if c.SessionIdleTimeoutMs <= 0 {
 		c.SessionIdleTimeoutMs = DefaultSessionIdleTimeoutMs
 	}
-	if c.StaleUnackedFileTTLms <= 0 {
-		c.StaleUnackedFileTTLms = DefaultStaleUnackedFileTTLms
-	}
-	if c.TombstoneTTLms <= 0 {
-		c.TombstoneTTLms = DefaultTombstoneTTLms
-	}
 	if c.CleanupIntervalMs <= 0 {
 		c.CleanupIntervalMs = DefaultCleanupIntervalMs
 	}
@@ -383,12 +351,6 @@ func (c *AppConfig) Normalize() {
 	if c.MaxOutOfOrderSegments <= 0 {
 		c.MaxOutOfOrderSegments = DefaultMaxOutOfOrderSegments
 	}
-	if c.AckEverySegments <= 0 {
-		c.AckEverySegments = DefaultAckEverySegments
-	}
-	if c.AckIntervalMs <= 0 {
-		c.AckIntervalMs = DefaultAckIntervalMs
-	}
 	if strings.TrimSpace(c.Compression) == "" {
 		c.Compression = DefaultCompression
 	}
@@ -432,9 +394,6 @@ func (c *AppConfig) Normalize() {
 	}
 	if c.Retry.MaxRetriesPerOperation <= 0 {
 		c.Retry.MaxRetriesPerOperation = DefaultRetryMaxRetriesPerOperation
-	}
-	if c.Retry.RetryForeverForPendingUploads == nil {
-		c.Retry.RetryForeverForPendingUploads = boolPtr(DefaultRetryForeverForPendingUploads)
 	}
 
 	c.Transport.ApplyDefaults()
@@ -487,10 +446,6 @@ func (c *AppConfig) RawIPWarned() bool {
 
 func (c *AppConfig) PrivateIPsBlocked() bool {
 	return c.BlockPrivateIPs == nil || *c.BlockPrivateIPs
-}
-
-func (c *AppConfig) RetryForeverForPendingUploads() bool {
-	return c.Retry.RetryForeverForPendingUploads == nil || *c.Retry.RetryForeverForPendingUploads
 }
 
 func (c *AppConfig) EnabledGoogleBackends() []GoogleBackendConfig {

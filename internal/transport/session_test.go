@@ -17,10 +17,10 @@ func TestDuplicateSeqIgnored(t *testing.T) {
 		CreatedUnixMs: time.Now().UnixMilli(),
 	}
 	env.EnsureChecksum()
-	if _, advanced, _, err := s.ProcessRx(env); err != nil || !advanced {
+	if advanced, _, err := s.ProcessRx(env); err != nil || !advanced {
 		t.Fatalf("first ProcessRx failed advanced=%v err=%v", advanced, err)
 	}
-	if _, advanced, _, err := s.ProcessRx(env); err != nil {
+	if advanced, _, err := s.ProcessRx(env); err != nil {
 		t.Fatalf("duplicate ProcessRx failed: %v", err)
 	} else if advanced {
 		t.Fatalf("duplicate seq should not advance")
@@ -62,21 +62,45 @@ func TestOutOfOrderBuffered(t *testing.T) {
 	}
 	first.EnsureChecksum()
 
-	if _, advanced, _, err := s.ProcessRx(second); err != nil {
+	if advanced, _, err := s.ProcessRx(second); err != nil {
 		t.Fatalf("process second failed: %v", err)
 	} else if advanced {
 		t.Fatalf("out-of-order segment should not advance immediately")
 	}
-	if acked, advanced, _, err := s.ProcessRx(first); err != nil {
+	if advanced, _, err := s.ProcessRx(first); err != nil {
 		t.Fatalf("process first failed: %v", err)
-	} else if !advanced || acked != 1 {
-		t.Fatalf("expected ack advancement to 1, got advanced=%v acked=%d", advanced, acked)
+	} else if !advanced {
+		t.Fatalf("expected in-order advance after missing segment arrived")
 	}
 
 	got1 := <-s.RxChan
 	got2 := <-s.RxChan
 	if string(got1) != "one" || string(got2) != "two" {
 		t.Fatalf("unexpected delivery order %q %q", got1, got2)
+	}
+}
+
+func TestGapTimedOut(t *testing.T) {
+	t.Parallel()
+
+	s := NewSession("s1")
+	env := &Envelope{
+		SessionID:     "s1",
+		Seq:           2,
+		Kind:          KindData,
+		Payload:       []byte("late"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env.EnsureChecksum()
+
+	if advanced, _, err := s.ProcessRx(env); err != nil {
+		t.Fatalf("process rx failed: %v", err)
+	} else if advanced {
+		t.Fatalf("gap should not advance")
+	}
+	time.Sleep(25 * time.Millisecond)
+	if !s.GapTimedOut(time.Now(), 10*time.Millisecond) {
+		t.Fatalf("expected gap timeout to trip")
 	}
 }
 

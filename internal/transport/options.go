@@ -8,8 +8,6 @@ type Options struct {
 	ServerID                     string
 	TunnelID                     string
 	SessionIdleTimeout           time.Duration
-	StaleUnackedFileTTL          time.Duration
-	TombstoneTTL                 time.Duration
 	CleanupInterval              time.Duration
 	HeartbeatInterval            time.Duration
 	PollRate                     time.Duration
@@ -25,11 +23,13 @@ type Options struct {
 	MaxPendingSegmentsPerSession int
 	MaxTxBufferBytesPerSession   int
 	MaxOutOfOrderSegments        int
-	AckEverySegments             int
-	AckInterval                  time.Duration
 	Compression                  string
 	CompressionMinBytes          int
 	UploadInterval               time.Duration
+	GapGracePeriod               time.Duration
+	ManifestChunkWindow          int
+	SeenChunkCacheSize           int
+	ChunkOrphanTTL               time.Duration
 }
 
 func DefaultOptions() Options {
@@ -37,8 +37,6 @@ func DefaultOptions() Options {
 		DataDir:                      "./data",
 		TunnelID:                     "main",
 		SessionIdleTimeout:           5 * time.Minute,
-		StaleUnackedFileTTL:          30 * time.Minute,
-		TombstoneTTL:                 5 * time.Minute,
 		CleanupInterval:              30 * time.Second,
 		HeartbeatInterval:            30 * time.Second,
 		PollRate:                     750 * time.Millisecond,
@@ -54,11 +52,13 @@ func DefaultOptions() Options {
 		MaxPendingSegmentsPerSession: 256,
 		MaxTxBufferBytesPerSession:   4 * 1024 * 1024,
 		MaxOutOfOrderSegments:        64,
-		AckEverySegments:             8,
-		AckInterval:                  time.Second,
 		Compression:                  "off",
 		CompressionMinBytes:          4096,
 		UploadInterval:               250 * time.Millisecond,
+		GapGracePeriod:               2 * time.Second,
+		ManifestChunkWindow:          256,
+		SeenChunkCacheSize:           1024,
+		ChunkOrphanTTL:               10 * time.Minute,
 	}
 }
 
@@ -72,12 +72,6 @@ func (o *Options) ApplyDefaults() {
 	}
 	if o.SessionIdleTimeout <= 0 {
 		o.SessionIdleTimeout = def.SessionIdleTimeout
-	}
-	if o.StaleUnackedFileTTL <= 0 {
-		o.StaleUnackedFileTTL = def.StaleUnackedFileTTL
-	}
-	if o.TombstoneTTL <= 0 {
-		o.TombstoneTTL = def.TombstoneTTL
 	}
 	if o.CleanupInterval <= 0 {
 		o.CleanupInterval = def.CleanupInterval
@@ -124,12 +118,6 @@ func (o *Options) ApplyDefaults() {
 	if o.MaxOutOfOrderSegments <= 0 {
 		o.MaxOutOfOrderSegments = def.MaxOutOfOrderSegments
 	}
-	if o.AckEverySegments <= 0 {
-		o.AckEverySegments = def.AckEverySegments
-	}
-	if o.AckInterval <= 0 {
-		o.AckInterval = def.AckInterval
-	}
 	if o.Compression == "" {
 		o.Compression = def.Compression
 	}
@@ -138,5 +126,17 @@ func (o *Options) ApplyDefaults() {
 	}
 	if o.UploadInterval <= 0 {
 		o.UploadInterval = def.UploadInterval
+	}
+	if o.GapGracePeriod <= 0 {
+		o.GapGracePeriod = def.GapGracePeriod
+	}
+	if o.ManifestChunkWindow <= 0 {
+		o.ManifestChunkWindow = def.ManifestChunkWindow
+	}
+	if o.SeenChunkCacheSize <= 0 {
+		o.SeenChunkCacheSize = def.SeenChunkCacheSize
+	}
+	if o.ChunkOrphanTTL <= 0 {
+		o.ChunkOrphanTTL = def.ChunkOrphanTTL
 	}
 }

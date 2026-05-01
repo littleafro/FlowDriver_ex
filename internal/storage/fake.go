@@ -25,6 +25,7 @@ type FakeBackend struct {
 	uploads   map[string]int
 	downloads map[string]int
 	deletes   map[string]int
+	lists     int
 
 	uploadFailures   int
 	listFailures     int
@@ -110,6 +111,7 @@ func (b *FakeBackend) ListQuery(ctx context.Context, prefix string) ([]string, e
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.lists++
 	if err := b.fail("list"); err != nil {
 		return nil, err
 	}
@@ -283,6 +285,12 @@ func (b *FakeBackend) DownloadCalls(filename string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.downloads[filename]
+}
+
+func (b *FakeBackend) ListCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lists
 }
 
 func (b *FakeBackend) fail(op string) error {
