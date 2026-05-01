@@ -104,6 +104,29 @@ func isUnauthorizedError(err error) bool {
 	return false
 }
 
+func isRateLimitedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errRateBudgetExhausted) {
+		return true
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusTooManyRequests {
+			return true
+		}
+		if statusErr.StatusCode == http.StatusForbidden {
+			body := strings.ToLower(statusErr.Body)
+			return strings.Contains(body, "quota") ||
+				strings.Contains(body, "rate") ||
+				strings.Contains(body, "user rate limit") ||
+				strings.Contains(body, "daily limit")
+		}
+	}
+	return false
+}
+
 func retryDelay(cfg RetryConfig, attempt int) time.Duration {
 	if attempt <= 0 {
 		attempt = 1

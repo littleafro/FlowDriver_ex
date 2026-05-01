@@ -17,3 +17,5 @@ go1.26/
 /server_logs.txt
 /curl_logs.txt
 creds/
+data-client/
+data-server/

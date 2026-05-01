@@ -34,6 +34,32 @@ func TestRetryableHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestIsRateLimitedError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "429", err: &httpStatusError{Operation: "put", StatusCode: 429, Body: "too many requests"}, want: true},
+		{name: "403 quota", err: &httpStatusError{Operation: "list", StatusCode: 403, Body: "user rate limit exceeded"}, want: true},
+		{name: "local budget", err: errRateBudgetExhausted, want: true},
+		{name: "401", err: &httpStatusError{Operation: "token", StatusCode: 401, Body: "invalid credentials"}, want: false},
+		{name: "generic", err: io.EOF, want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRateLimitedError(tc.err); got != tc.want {
+				t.Fatalf("isRateLimitedError(%v)=%v want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRateLimiterWaits(t *testing.T) {
 	t.Parallel()
 

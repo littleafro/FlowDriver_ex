@@ -76,16 +76,21 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 		session.QueueClose()
 		return
 	}
-	defer conn.Close()
 
 	virtual := transport.NewVirtualConn(session, nil)
 	var wg sync.WaitGroup
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = conn.Close()
+			_ = virtual.Close()
+		})
+	}
 	wg.Add(2)
 
 	go func() {
 		<-ctx.Done()
-		_ = conn.Close()
-		_ = virtual.Close()
+		closeBoth()
 	}()
 
 	go func() {
@@ -93,6 +98,7 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 		_, err := io.Copy(virtual, conn)
 		if err != nil && err != io.EOF {
 			log.Printf("copy upstream->session error target=%s session=%s: %v", session.TargetAddr, session.ID, err)
+			closeBoth()
 		}
 		_ = virtual.CloseWrite()
 	}()
@@ -102,6 +108,7 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 		_, err := io.Copy(conn, virtual)
 		if err != nil && err != io.EOF {
 			log.Printf("copy session->upstream error target=%s session=%s: %v", session.TargetAddr, session.ID, err)
+			closeBoth()
 		}
 		if closer, ok := conn.(interface{ CloseWrite() error }); ok {
 			_ = closer.CloseWrite()
@@ -109,5 +116,6 @@ func handleServerConn(ctx context.Context, session *transport.Session, policy *n
 	}()
 
 	wg.Wait()
+	closeBoth()
 	session.QueueClose()
 }

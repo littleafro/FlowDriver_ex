@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +71,7 @@ type GoogleBackend struct {
 	healthMu   sync.RWMutex
 	health     HealthState
 	healthSink func(HealthState)
+	verbose    bool
 }
 
 func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBackend {
@@ -89,6 +91,7 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 			MaxRetriesPerOperation:        6,
 			RetryForeverForPendingUploads: true,
 		},
+		verbose: googleVerboseFromEnv(),
 	}
 }
 
@@ -108,6 +111,7 @@ func NewGoogleBackendWithOptions(opts GoogleBackendOptions) *GoogleBackend {
 		health:          HealthHealthy,
 		retryCfg:        opts.Retry,
 		limiter:         newRequestRateLimiter(opts.Name, opts.RateLimits),
+		verbose:         googleVerboseFromEnv(),
 	}
 }
 
@@ -237,6 +241,34 @@ func (b *GoogleBackend) listCreatedAfter() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.listAfterMs
+}
+
+func googleVerboseFromEnv() bool {
+	raw, ok := os.LookupEnv("FLOWDRIVER_GOOGLE_VERBOSE")
+	if !ok {
+		return false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err == nil {
+		return parsed
+	}
+	switch strings.ToLower(raw) {
+	case "on", "yes", "debug", "verbose":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *GoogleBackend) vlogf(format string, args ...any) {
+	if b == nil || !b.verbose {
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (b *GoogleBackend) exchangeCodeLocked(ctx context.Context, code string) error {
@@ -372,6 +404,8 @@ func (b *GoogleBackend) ValidateFolder(ctx context.Context) error {
 }
 
 func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Reader) error {
+	started := time.Now()
+	attempts := 0
 	payload, err := io.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("failed to buffer upload payload: %w", err)
@@ -381,6 +415,7 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 	}
 
 	_, err = retryOperation(ctx, b.retryCfg, "upload", b.retryCfg.RetryForeverForPendingUploads, func() (struct{}, error) {
+		attempts++
 		tok, err := b.getValidToken(ctx)
 		if err != nil {
 			return struct{}{}, err
@@ -424,10 +459,14 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 	if err == nil {
 		b.setHealth(HealthHealthy)
 	}
+	b.vlogf("backend %s op=upload filename=%s bytes=%d attempts=%d elapsed=%s err=%v",
+		b.name, filename, len(payload), attempts, time.Since(started), err)
 	return err
 }
 
 func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader) error {
+	started := time.Now()
+	attempts := 0
 	payload, err := io.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("failed to buffer put payload: %w", err)
@@ -437,6 +476,7 @@ func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader
 	}
 
 	_, err = retryOperation(ctx, b.retryCfg, "put", false, func() (struct{}, error) {
+		attempts++
 		tok, err := b.getValidToken(ctx)
 		if err != nil {
 			return struct{}{}, err
@@ -492,12 +532,16 @@ func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader
 	if err == nil {
 		b.setHealth(HealthHealthy)
 	}
+	b.vlogf("backend %s op=put filename=%s bytes=%d attempts=%d elapsed=%s err=%v",
+		b.name, filename, len(payload), attempts, time.Since(started), err)
 	return err
 }
 
 func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string, error) {
+	started := time.Now()
 	files, err := b.listFiles(ctx, prefix)
 	if err != nil {
+		b.vlogf("backend %s op=list_query prefix=%q elapsed=%s err=%v", b.name, prefix, time.Since(started), err)
 		return nil, err
 	}
 	names := make([]string, 0, len(files))
@@ -508,11 +552,17 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		}
 	}
 	sort.Strings(names)
+	b.setHealth(HealthHealthy)
+	b.vlogf("backend %s op=list_query prefix=%q names=%d elapsed=%s", b.name, prefix, len(names), time.Since(started))
 	return names, nil
 }
 
 func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadCloser, error) {
-	return retryOperation(ctx, b.retryCfg, "download", false, func() (io.ReadCloser, error) {
+	started := time.Now()
+	attempts := 0
+	contentLength := int64(-1)
+	rc, err := retryOperation(ctx, b.retryCfg, "download", false, func() (io.ReadCloser, error) {
+		attempts++
 		fileID, err := b.fileIDForName(ctx, filename)
 		if err != nil {
 			return nil, err
@@ -542,6 +592,7 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 			return nil, readHTTPError("download", resp)
 		}
 
+		contentLength = resp.ContentLength
 		if err := b.reserveDownload(resp.ContentLength); err != nil {
 			resp.Body.Close()
 			return nil, err
@@ -550,6 +601,12 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 	}, func(attempt int, err error, delay time.Duration) {
 		b.onRetry("download", attempt, err, delay)
 	})
+	if err == nil {
+		b.setHealth(HealthHealthy)
+	}
+	b.vlogf("backend %s op=download filename=%s content_length=%d attempts=%d elapsed=%s err=%v",
+		b.name, filename, contentLength, attempts, time.Since(started), err)
+	return rc, err
 }
 
 func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
@@ -761,7 +818,11 @@ func (b *GoogleBackend) lookupExactName(ctx context.Context, filename string) ([
 }
 
 func (b *GoogleBackend) queryFiles(ctx context.Context, query string) ([]googleFile, error) {
-	return retryOperation(ctx, b.retryCfg, "list", false, func() ([]googleFile, error) {
+	started := time.Now()
+	attempts := 0
+	pages := 0
+	files, err := retryOperation(ctx, b.retryCfg, "list", false, func() ([]googleFile, error) {
+		attempts++
 		tok, err := b.getValidToken(ctx)
 		if err != nil {
 			return nil, err
@@ -773,6 +834,7 @@ func (b *GoogleBackend) queryFiles(ctx context.Context, query string) ([]googleF
 		var all []googleFile
 		pageToken := ""
 		for {
+			pages++
 			u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
 			values := u.Query()
 			values.Set("q", query)
@@ -819,6 +881,9 @@ func (b *GoogleBackend) queryFiles(ctx context.Context, query string) ([]googleF
 	}, func(attempt int, err error, delay time.Duration) {
 		b.onRetry("list", attempt, err, delay)
 	})
+	b.vlogf("backend %s op=list attempts=%d pages=%d elapsed=%s query=%q err=%v",
+		b.name, attempts, pages, time.Since(started), query, err)
+	return files, err
 }
 
 func (b *GoogleBackend) fileIDForName(ctx context.Context, filename string) (string, error) {
@@ -867,6 +932,7 @@ func (b *GoogleBackend) reserveUpload(bytes int64) error {
 	}
 	if err := b.limiter.reserveUpload(bytes); err != nil {
 		b.setHealth(HealthRateLimited)
+		log.Printf("backend %s [RATE_LIMIT] reserve upload bytes=%d: %v", b.name, bytes, err)
 		return err
 	}
 	return nil
@@ -878,6 +944,7 @@ func (b *GoogleBackend) reserveDownload(bytes int64) error {
 	}
 	if err := b.limiter.reserveDownload(bytes); err != nil {
 		b.setHealth(HealthRateLimited)
+		log.Printf("backend %s [RATE_LIMIT] reserve download bytes=%d: %v", b.name, bytes, err)
 		return err
 	}
 	return nil
@@ -889,12 +956,12 @@ func (b *GoogleBackend) onRetry(op string, attempt int, err error, delay time.Du
 		b.setHealth(HealthAuthFailed)
 		return
 	}
+	if isRateLimitedError(err) {
+		log.Printf("backend %s [RATE_LIMIT] op=%s attempt=%d retry_in=%s err=%v", b.name, op, attempt, delay, err)
+		b.setHealth(HealthRateLimited)
+		return
+	}
 	if isRetryableError(err) {
-		var statusErr *httpStatusError
-		if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusTooManyRequests || statusErr.StatusCode == http.StatusForbidden) {
-			b.setHealth(HealthRateLimited)
-			return
-		}
 		b.setHealth(HealthDegraded)
 	}
 }
