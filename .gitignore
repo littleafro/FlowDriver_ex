@@ -19,3 +19,4 @@ go1.26/
 creds/
 data-client/
 data-server/
+.tmp*/
