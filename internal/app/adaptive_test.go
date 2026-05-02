@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/NullLatency/flow-driver/internal/config"
+	"github.com/NullLatency/flow-driver/internal/httpclient"
 )
 
 func TestAdaptiveInitialEngineOptionsIgnoreManualTuning(t *testing.T) {
@@ -61,5 +62,30 @@ func TestAdaptiveTransportCandidatesPreferPersistedProfile(t *testing.T) {
 	}
 	if candidates[0] != profile {
 		t.Fatalf("expected persisted profile to be first candidate")
+	}
+}
+
+func TestAdaptiveTransportPinnedByExplicitFronting(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AppConfig{
+	}
+	backendCfg := config.GoogleBackendConfig{
+		Transport: httpclient.TransportConfig{
+			TargetIP:   "216.239.38.120:443",
+			SNI:        "www.google.com",
+			HostHeader: "www.googleapis.com",
+		},
+		TokenURL: "https://www.googleapis.com/oauth2/v4/token",
+	}
+	if !adaptiveTransportPinned(cfg, backendCfg) {
+		t.Fatalf("expected explicit backend fronting settings to pin adaptive transport")
+	}
+	profile := adaptiveConfiguredProfile(cfg, backendCfg)
+	if profile.TargetIP != "216.239.38.120:443" || profile.SNI != "www.google.com" || profile.HostHeader != "www.googleapis.com" {
+		t.Fatalf("unexpected pinned profile: %+v", profile)
+	}
+	if profile.TokenURL != "https://www.googleapis.com/oauth2/v4/token" {
+		t.Fatalf("unexpected token URL %q", profile.TokenURL)
 	}
 }

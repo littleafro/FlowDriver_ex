@@ -35,6 +35,12 @@ func TestLoadBackwardCompatibleConfig(t *testing.T) {
 	if cfg.PollRateMs != 1234 {
 		t.Fatalf("PollRateMs = %d, want 1234", cfg.PollRateMs)
 	}
+	if cfg.ActivePollRateMs != 1234 {
+		t.Fatalf("ActivePollRateMs = %d, want 1234", cfg.ActivePollRateMs)
+	}
+	if cfg.IdlePollRateMs != 1234 {
+		t.Fatalf("IdlePollRateMs = %d, want 1234", cfg.IdlePollRateMs)
+	}
 	if cfg.FlushRateMs != 4321 {
 		t.Fatalf("FlushRateMs = %d, want 4321", cfg.FlushRateMs)
 	}

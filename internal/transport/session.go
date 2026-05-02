@@ -28,9 +28,13 @@ type Session struct {
 	rxClosed         bool
 	closed           bool
 	openSent         bool
+	bootstrapPending bool
 	rxChanClosed     bool
 	gapSeq           uint64
 	gapSince         time.Time
+	turboUntil       time.Time
+	txCommittedBytes uint64
+	directChunks     int
 	TargetAddr       string
 	ClientID         string
 	BackendName      string
@@ -51,6 +55,7 @@ func NewSession(id string) *Session {
 		rxQueue:          make(map[uint64]*Envelope),
 		lastActivity:     time.Now(),
 		lastHeartbeatTx:  time.Now(),
+		turboUntil:       time.Now().Add(10 * time.Second),
 		maxTxBufferBytes: 4 * 1024 * 1024,
 		maxOutOfOrder:    64,
 		flushThreshold:   64 * 1024,
@@ -86,6 +91,7 @@ func (s *Session) EnqueueTx(data []byte) {
 		s.txBuf = append(s.txBuf, data...)
 	}
 	s.lastActivity = time.Now()
+	s.touchTurboLocked(10 * time.Second)
 	forceNotify := wasEmpty && len(s.txBuf) > 0 && s.onForceFlush != nil
 	notify := s.onFlush != nil && len(s.txBuf) >= s.flushThreshold
 	cb := s.onFlush
@@ -109,6 +115,7 @@ func (s *Session) QueueClose() {
 	}
 	s.closeQueued = true
 	s.lastActivity = time.Now()
+	s.touchTurboLocked(10 * time.Second)
 	cb := s.onFlush
 	s.mu.Unlock()
 
@@ -135,7 +142,7 @@ func (s *Session) PrepareEnvelopeBatch(now time.Time, segmentBytes, maxSegmentBy
 	if maxMuxSegments <= 0 {
 		maxMuxSegments = 1
 	}
-	if s.closeSent || s.rxClosed {
+	if s.closeSent {
 		return nil, nil
 	}
 
@@ -164,7 +171,7 @@ func (s *Session) PrepareEnvelopeBatch(now time.Time, segmentBytes, maxSegmentBy
 }
 
 func (s *Session) prepareEnvelopeLocked(now time.Time, segmentBytes, maxSegmentBytes int, force, allowHeartbeat bool, txOffset int, seq uint64, openSent bool) (*PreparedEnvelope, error) {
-	if s.closeSent || s.rxClosed {
+	if s.closeSent {
 		return nil, nil
 	}
 
@@ -241,16 +248,18 @@ func (s *Session) CommitEnvelope(env *Envelope, consumed int) error {
 
 	if consumed > 0 {
 		s.txBuf = append([]byte(nil), s.txBuf[consumed:]...)
+		s.txCommittedBytes += uint64(consumed)
 	}
 	s.txSeq++
 	s.openSent = s.openSent || env.Kind == KindOpen
 	if env.Kind == KindClose {
 		s.closeSent = true
-		s.closed = true
+		s.closed = s.rxClosed
 	}
 	if env.Kind == KindHeartbeat {
 		s.lastHeartbeatTx = time.Now()
 	}
+	s.touchTurboLocked(10 * time.Second)
 	s.txCond.Broadcast()
 	return nil
 }
@@ -262,6 +271,7 @@ func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 		return false, true, nil
 	}
 	s.lastActivity = time.Now()
+	s.touchTurboLocked(10 * time.Second)
 
 	if env.Seq < s.rxSeq {
 		s.mu.Unlock()
@@ -287,6 +297,7 @@ func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 
 	payloads := make([][]byte, 0, 2)
 	closeNow := false
+	sawPeerClose := false
 	for current := env; current != nil; {
 		if len(current.Payload) > 0 {
 			payloads = append(payloads, append([]byte(nil), current.Payload...))
@@ -295,13 +306,13 @@ func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 		switch current.Kind {
 		case KindClose:
 			s.rxClosed = true
-			s.closed = true
-			closeNow = true
-			case KindHeartbeat, KindOpen, KindData:
-			default:
-				s.mu.Unlock()
-				return false, false, fmt.Errorf("unknown envelope kind: %d", current.Kind)
-			}
+			s.closed = s.closeSent
+			sawPeerClose = true
+		case KindHeartbeat, KindOpen, KindData:
+		default:
+			s.mu.Unlock()
+			return false, false, fmt.Errorf("unknown envelope kind: %d", current.Kind)
+		}
 		if closeNow {
 			break
 		}
@@ -329,7 +340,7 @@ func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 			break
 		}
 	}
-	if closeNow {
+	if sawPeerClose || closeNow {
 		s.closeRxChan()
 	}
 	return true, closeNow, nil
@@ -398,7 +409,7 @@ func (s *Session) ReadyForTeardown(now time.Time, grace time.Duration) bool {
 	if len(s.txBuf) > 0 {
 		return false
 	}
-	if s.rxClosed {
+	if s.rxClosed && s.closeSent {
 		return true
 	}
 	if s.closeQueued || s.closeSent || s.closed {
@@ -426,4 +437,53 @@ func (s *Session) sendRx(payload []byte) (ok bool) {
 	}()
 	s.RxChan <- payload
 	return true
+}
+
+func (s *Session) touchTurboLocked(d time.Duration) {
+	until := time.Now().Add(d)
+	if until.After(s.turboUntil) {
+		s.turboUntil = until
+	}
+}
+
+func (s *Session) NeedsTurboPoll(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return now.Before(s.turboUntil) && !s.closed
+}
+
+func (s *Session) SetBootstrapPending(v bool) {
+	s.mu.Lock()
+	s.bootstrapPending = v
+	s.mu.Unlock()
+}
+
+func (s *Session) BootstrapPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bootstrapPending
+}
+
+func (s *Session) MarkBootstrapped() {
+	s.mu.Lock()
+	s.bootstrapPending = false
+	s.mu.Unlock()
+}
+
+func (s *Session) TxCommittedBytes() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.txCommittedBytes
+}
+
+func (s *Session) RecordDirectChunkPublished() {
+	s.mu.Lock()
+	s.directChunks++
+	s.mu.Unlock()
+}
+
+func (s *Session) DirectChunksPublished() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.directChunks
 }

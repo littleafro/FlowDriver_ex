@@ -104,6 +104,44 @@ func TestGapTimedOut(t *testing.T) {
 	}
 }
 
+func TestPeerCloseIsHalfClose(t *testing.T) {
+	t.Parallel()
+
+	s := NewSession("s1")
+	s.TargetAddr = "example.com:80"
+	s.EnqueueTx([]byte("response"))
+
+	closeEnv := &Envelope{
+		SessionID:     "s1",
+		Seq:           0,
+		Kind:          KindClose,
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	closeEnv.EnsureChecksum()
+
+	advanced, closedNow, err := s.ProcessRx(closeEnv)
+	if err != nil {
+		t.Fatalf("ProcessRx close failed: %v", err)
+	}
+	if !advanced {
+		t.Fatalf("peer close should advance receive sequence")
+	}
+	if closedNow {
+		t.Fatalf("peer close should not hard-close the session")
+	}
+
+	envs, err := s.PrepareEnvelopeBatch(time.Now(), 1, 64*1024, 4, true, false)
+	if err != nil {
+		t.Fatalf("PrepareEnvelopeBatch failed: %v", err)
+	}
+	if len(envs) == 0 {
+		t.Fatalf("expected buffered outbound data to remain sendable after peer close")
+	}
+	if envs[0].Env.Kind != KindOpen {
+		t.Fatalf("expected first outbound envelope to remain open, got %s", envs[0].Env.Kind.String())
+	}
+}
+
 func TestEnqueueTxTriggersForceFlushOnFirstSmallWrite(t *testing.T) {
 	t.Parallel()
 

@@ -36,6 +36,16 @@ type manifestFile struct {
 	Chunks        []manifestChunk `json:"chunks"`
 }
 
+type sessionHeadFile struct {
+	Dir           Direction       `json:"dir"`
+	ClientID      string          `json:"client_id"`
+	SessionID     string          `json:"session_id"`
+	TargetAddr    string          `json:"target_addr,omitempty"`
+	Epoch         uint64          `json:"epoch"`
+	UpdatedUnixMs int64           `json:"updated_unix_ms"`
+	Chunks        []manifestChunk `json:"chunks"`
+}
+
 func manifestFilename(d Direction, clientID string) string {
 	return "manifest-" + string(d) + "-" + safeID(clientID) + ".json"
 }
@@ -58,6 +68,14 @@ func parseManifestFilename(name string) (Direction, string, bool) {
 
 func chunkFilename(d Direction, clientID string, epoch uint64, chunkID string) string {
 	return fmt.Sprintf("chunk-%s-%s-%d-%s.bin", string(d), safeID(clientID), epoch, chunkID)
+}
+
+func sessionHeadFilename(d Direction, sessionID string) string {
+	return fmt.Sprintf("sess-%s-%s-head.json", safeID(sessionID), string(d))
+}
+
+func sessionChunkFilename(d Direction, sessionID string, epoch uint64, chunkID string) string {
+	return fmt.Sprintf("sess-%s-%s-%d-%s.bin", safeID(sessionID), string(d), epoch, chunkID)
 }
 
 func parseChunkFilename(name string) (Direction, string, uint64, string, int64, bool) {
@@ -242,6 +260,19 @@ func unsafeID(v string) (string, error) {
 		return "", err
 	}
 	return string(decoded), nil
+}
+
+func encodeSessionHead(head sessionHeadFile) ([]byte, error) {
+	head.UpdatedUnixMs = time.Now().UnixMilli()
+	return json.MarshalIndent(head, "", "  ")
+}
+
+func decodeSessionHead(payload []byte) (*sessionHeadFile, error) {
+	var head sessionHeadFile
+	if err := json.Unmarshal(payload, &head); err != nil {
+		return nil, err
+	}
+	return &head, nil
 }
 
 type seenChunkCache struct {

@@ -82,6 +82,24 @@ type backendBatch struct {
 	commits []sessionCommit
 }
 
+type sessionSendPlan struct {
+	segmentBytes    int
+	maxSegmentBytes int
+	maxMuxSegments  int
+	compression     string
+	compressionMin  int
+	bootstrap       bool
+	mirror          bool
+	force           bool
+}
+
+type chunkRoute uint8
+
+const (
+	routeBootstrap chunkRoute = iota + 1
+	routeDirect
+)
+
 type pendingChunk struct {
 	id         string
 	filename   string
@@ -90,6 +108,15 @@ type pendingChunk struct {
 	createdAt  time.Time
 	payload    []byte
 	sizeBytes  int
+	route      chunkRoute
+	sessionID  string
+	targetAddr string
+}
+
+type sessionHeadState struct {
+	head    sessionHeadFile
+	dirty   bool
+	version uint64
 }
 
 type backendState struct {
@@ -103,6 +130,7 @@ type backendState struct {
 	remoteEpoch     uint64
 	seenChunks      *seenChunkCache
 	inFlight        map[string]struct{}
+	sessionHeads    map[string]*sessionHeadState
 }
 
 type Engine struct {
@@ -164,9 +192,10 @@ func NewEngineWithPool(pool *storage.BackendPool, isClient bool, clientID string
 	}
 	for _, handle := range pool.Backends() {
 		e.backends[handle.Name] = &backendState{
-			name:       handle.Name,
-			seenChunks: newSeenChunkCache(opts.SeenChunkCacheSize, opts.ChunkOrphanTTL*3),
-			inFlight:   make(map[string]struct{}),
+			name:         handle.Name,
+			seenChunks:   newSeenChunkCache(opts.SeenChunkCacheSize, opts.ChunkOrphanTTL*3),
+			inFlight:     make(map[string]struct{}),
+			sessionHeads: make(map[string]*sessionHeadState),
 		}
 		e.metrics.backends[handle.Name] = &BackendStats{}
 	}
@@ -337,8 +366,8 @@ func (e *Engine) AddSession(s *Session) {
 			log.Printf("backend selection failed session=%s: %v", s.ID, err)
 		}
 	}
-	if s.BackendEpoch == 0 {
-		s.BackendEpoch = e.epoch
+	if e.myDir == DirReq && s.BackendEpoch == 0 {
+		s.SetBootstrapPending(true)
 	}
 
 	e.sessionMu.Lock()
@@ -350,7 +379,6 @@ func (e *Engine) AddSession(s *Session) {
 	e.metrics.activeSessions = count
 	e.metrics.mu.Unlock()
 	log.Printf("session open %s client=%s backend=%s epoch=%d", s.ID, s.ClientID, s.BackendName, s.BackendEpoch)
-	e.notifyForceFlush()
 }
 
 func (e *Engine) RemoveSession(id string) {
@@ -410,8 +438,6 @@ func (e *Engine) flushAll(force bool) {
 	}
 
 	now := time.Now()
-	payloads := make(map[string]*backendBatch)
-
 	for _, s := range sessions {
 		if now.Sub(s.LastActivity()) >= opts.SessionIdleTimeout && !s.HasCloseQueued() {
 			log.Printf("session %s idle for %s, queuing close", s.ID, now.Sub(s.LastActivity()))
@@ -425,8 +451,9 @@ func (e *Engine) flushAll(force bool) {
 			}
 			s.BackendName = backend.Name
 		}
+		plan := e.sessionSendPlanFor(s, opts, force)
 		allowHeartbeat := opts.HeartbeatInterval > 0 && s.CanHeartbeat(now, opts.HeartbeatInterval)
-		envs, err := s.PrepareEnvelopeBatch(now, opts.SegmentBytes, opts.MaxSegmentBytes, opts.MaxMuxSegments, force, allowHeartbeat)
+		envs, err := s.PrepareEnvelopeBatch(now, plan.segmentBytes, plan.maxSegmentBytes, plan.maxMuxSegments, plan.force, allowHeartbeat)
 		if err != nil {
 			log.Printf("prepare envelope batch failed session=%s: %v", s.ID, err)
 			continue
@@ -434,48 +461,43 @@ func (e *Engine) flushAll(force bool) {
 		if len(envs) == 0 {
 			continue
 		}
-		batch := payloads[s.BackendName]
-		if batch == nil {
-			batch = &backendBatch{
-				envs:    make([]*Envelope, 0, len(envs)),
-				commits: make([]sessionCommit, 0, len(envs)),
+		chunkEnvs := make([]*Envelope, 0, len(envs))
+		for i := range envs {
+			chunkEnvs = append(chunkEnvs, envs[i].Env)
+		}
+		payload, _, err := marshalChunkPayloads(chunkEnvs, plan.compression, plan.compressionMin)
+		if err != nil {
+			log.Printf("marshal chunk payload failed session=%s: %v", s.ID, err)
+			continue
+		}
+		recipients := e.chunkRecipientsForSession(s, plan.mirror)
+		enqueued := 0
+		for _, handle := range recipients {
+			if e.enqueueChunk(handle.Name, payload, time.Now(), plan.bootstrap, s.ID, s.TargetAddr) {
+				enqueued++
 			}
-			payloads[s.BackendName] = batch
+		}
+		if enqueued == 0 {
+			if len(recipients) > 0 {
+				log.Printf("chunk queue full session=%s backend=%s queued=%d", s.ID, recipients[0].Name, e.pendingChunkDepth(recipients[0].Name))
+			}
+			continue
 		}
 		for i := range envs {
-			batch.envs = append(batch.envs, envs[i].Env)
-			batch.commits = append(batch.commits, sessionCommit{
-				session:  s,
-				env:      envs[i].Env,
-				consumed: envs[i].Consumed,
-			})
-		}
-	}
-
-	if len(payloads) == 0 {
-		return
-	}
-
-	for backendName, batch := range payloads {
-		payload, _, err := marshalChunkPayloads(batch.envs, opts.Compression, opts.CompressionMinBytes)
-		if err != nil {
-			log.Printf("marshal chunk payload failed backend=%s: %v", backendName, err)
-			continue
-		}
-		if !e.enqueueChunk(backendName, payload, time.Now()) {
-			log.Printf("chunk queue full backend=%s queued=%d", backendName, e.pendingChunkDepth(backendName))
-			continue
-		}
-		for _, commit := range batch.commits {
-			if err := commit.session.CommitEnvelope(commit.env, commit.consumed); err != nil {
-				log.Printf("commit envelope failed session=%s seq=%d: %v", commit.session.ID, commit.env.Seq, err)
+			if err := s.CommitEnvelope(envs[i].Env, envs[i].Consumed); err != nil {
+				log.Printf("commit envelope failed session=%s seq=%d: %v", s.ID, envs[i].Env.Seq, err)
 			}
+		}
+		if plan.bootstrap {
+			s.MarkBootstrapped()
+		} else {
+			s.RecordDirectChunkPublished()
 		}
 	}
 	e.triggerUpload()
 }
 
-func (e *Engine) enqueueChunk(backendName string, payload []byte, createdAt time.Time) bool {
+func (e *Engine) enqueueChunk(backendName string, payload []byte, createdAt time.Time, bootstrap bool, sessionID, targetAddr string) bool {
 	clientID := e.clientID()
 	if clientID == "" {
 		return false
@@ -488,22 +510,34 @@ func (e *Engine) enqueueChunk(backendName string, payload []byte, createdAt time
 	if len(state.queue) >= opts.MaxPendingSegmentsPerSession {
 		return false
 	}
-	if state.localManifest.ClientID == "" {
+	route := routeDirect
+	filename := ""
+	chunkID := newChunkID(createdAt)
+	if bootstrap {
+		route = routeBootstrap
+		filename = chunkFilename(e.myDir, clientID, e.epoch, chunkID)
+	}
+	if route == routeBootstrap && state.localManifest.ClientID == "" {
 		state.localManifest = manifestFile{
 			Dir:      e.myDir,
 			ClientID: clientID,
 			Epoch:    e.epoch,
 		}
 	}
-	chunkID := newChunkID(createdAt)
+	if route == routeDirect {
+		filename = sessionChunkFilename(e.myDir, sessionID, e.epoch, chunkID)
+	}
 	state.queue = append(state.queue, &pendingChunk{
 		id:        chunkID,
-		filename:  chunkFilename(e.myDir, clientID, e.epoch, chunkID),
+		filename:  filename,
 		backend:   backendName,
 		epoch:     e.epoch,
 		createdAt: createdAt,
 		payload:   payload,
 		sizeBytes: len(payload),
+		route:     route,
+		sessionID: sessionID,
+		targetAddr: targetAddr,
 	})
 	e.updatePendingChunkMetrics(backendName, len(state.queue))
 	return true
@@ -514,6 +548,60 @@ func (e *Engine) pendingChunkDepth(backendName string) int {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return len(state.queue)
+}
+
+func (e *Engine) sessionSendPlanFor(s *Session, opts Options, force bool) sessionSendPlan {
+	interactive := s.TxCommittedBytes() < 128*1024 && s.DirectChunksPublished() < 4
+	plan := sessionSendPlan{
+		segmentBytes:    opts.SegmentBytes,
+		maxSegmentBytes: opts.MaxSegmentBytes,
+		maxMuxSegments:  opts.MaxMuxSegments,
+		compression:     opts.Compression,
+		compressionMin:  opts.CompressionMinBytes,
+		bootstrap:       s.BootstrapPending(),
+		force:           force,
+	}
+	if interactive {
+		if plan.segmentBytes > 16*1024 {
+			plan.segmentBytes = 16 * 1024
+		}
+		if plan.maxSegmentBytes > 32*1024 {
+			plan.maxSegmentBytes = 32 * 1024
+		}
+		if plan.maxMuxSegments > 4 {
+			plan.maxMuxSegments = 4
+		}
+		plan.compression = "off"
+		plan.force = true
+	}
+	if plan.bootstrap || s.DirectChunksPublished() < 2 {
+		plan.mirror = len(e.pool.HealthyBackends()) > 1
+	}
+	return plan
+}
+
+func (e *Engine) chunkRecipientsForSession(s *Session, mirror bool) []*storage.BackendHandle {
+	if mirror {
+		backends := e.pool.HealthyBackends()
+		if len(backends) > 0 {
+			return backends
+		}
+	}
+	if s.BackendName != "" {
+		for _, handle := range e.pool.Backends() {
+			if handle.Name == s.BackendName {
+				return []*storage.BackendHandle{handle}
+			}
+		}
+	}
+	backends := e.pool.HealthyBackends()
+	if len(backends) > 0 {
+		return backends[:1]
+	}
+	if len(e.pool.Backends()) > 0 {
+		return e.pool.Backends()[:1]
+	}
+	return nil
 }
 
 func (e *Engine) triggerUpload() {
@@ -588,23 +676,49 @@ func (e *Engine) uploadChunk(ctx context.Context, handle *storage.BackendHandle,
 
 	state := e.backendState(handle.Name)
 	state.mu.Lock()
-	if state.localManifest.ClientID == "" {
+	if chunk.route == routeBootstrap && state.localManifest.ClientID == "" {
 		state.localManifest = manifestFile{
 			Dir:      e.myDir,
 			ClientID: e.clientID(),
 			Epoch:    e.epoch,
 		}
 	}
-	state.localManifest.Chunks = append(state.localManifest.Chunks, manifestChunk{
-		ID:            chunk.id,
-		CreatedUnixMs: chunk.createdAt.UnixMilli(),
-		SizeBytes:     chunk.sizeBytes,
-	})
-	if len(state.localManifest.Chunks) > e.currentOptions().ManifestChunkWindow {
-		state.localManifest.Chunks = append([]manifestChunk(nil), state.localManifest.Chunks[len(state.localManifest.Chunks)-e.currentOptions().ManifestChunkWindow:]...)
+	if chunk.route == routeBootstrap {
+		state.localManifest.Chunks = append(state.localManifest.Chunks, manifestChunk{
+			ID:            chunk.id,
+			CreatedUnixMs: chunk.createdAt.UnixMilli(),
+			SizeBytes:     chunk.sizeBytes,
+		})
+		if len(state.localManifest.Chunks) > e.currentOptions().ManifestChunkWindow {
+			state.localManifest.Chunks = append([]manifestChunk(nil), state.localManifest.Chunks[len(state.localManifest.Chunks)-e.currentOptions().ManifestChunkWindow:]...)
+		}
+		state.manifestDirty = true
+		state.manifestVersion++
+	} else {
+		headState := state.sessionHeads[chunk.sessionID]
+		if headState == nil {
+			headState = &sessionHeadState{
+				head: sessionHeadFile{
+					Dir:        e.myDir,
+					ClientID:   e.clientID(),
+					SessionID:  chunk.sessionID,
+					TargetAddr: chunk.targetAddr,
+					Epoch:      e.epoch,
+				},
+			}
+			state.sessionHeads[chunk.sessionID] = headState
+		}
+		headState.head.Chunks = append(headState.head.Chunks, manifestChunk{
+			ID:            chunk.id,
+			CreatedUnixMs: chunk.createdAt.UnixMilli(),
+			SizeBytes:     chunk.sizeBytes,
+		})
+		if len(headState.head.Chunks) > e.currentOptions().ManifestChunkWindow {
+			headState.head.Chunks = append([]manifestChunk(nil), headState.head.Chunks[len(headState.head.Chunks)-e.currentOptions().ManifestChunkWindow:]...)
+		}
+		headState.dirty = true
+		headState.version++
 	}
-	state.manifestDirty = true
-	state.manifestVersion++
 	state.mu.Unlock()
 
 	e.metrics.mu.Lock()
@@ -612,8 +726,12 @@ func (e *Engine) uploadChunk(ctx context.Context, handle *storage.BackendHandle,
 	e.metrics.backends[handle.Name].LastPublishLatency = latency
 	e.metrics.mu.Unlock()
 
-	if err := e.publishManifest(ctx, handle); err != nil {
-		log.Printf("manifest publish error backend=%s: %v", handle.Name, err)
+	if chunk.route == routeBootstrap {
+		if err := e.publishManifest(ctx, handle); err != nil {
+			log.Printf("manifest publish error backend=%s: %v", handle.Name, err)
+		}
+	} else if err := e.publishSessionHead(ctx, handle, chunk.sessionID); err != nil {
+		log.Printf("session head publish error backend=%s session=%s: %v", handle.Name, chunk.sessionID, err)
 	}
 }
 
@@ -622,6 +740,7 @@ func (e *Engine) publishDirtyManifests(ctx context.Context) {
 		if err := e.publishManifest(ctx, handle); err != nil {
 			log.Printf("manifest publish retry error backend=%s: %v", handle.Name, err)
 		}
+		e.publishDirtySessionHeads(ctx, handle)
 	}
 }
 
@@ -657,6 +776,53 @@ func (e *Engine) publishManifest(ctx context.Context, handle *storage.BackendHan
 	return nil
 }
 
+func (e *Engine) publishSessionHead(ctx context.Context, handle *storage.BackendHandle, sessionID string) error {
+	state := e.backendState(handle.Name)
+	state.mu.Lock()
+	headState := state.sessionHeads[sessionID]
+	if headState == nil || !headState.dirty {
+		state.mu.Unlock()
+		return nil
+	}
+	version := headState.version
+	payload, err := encodeSessionHead(headState.head)
+	filename := sessionHeadFilename(e.myDir, sessionID)
+	state.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := handle.Backend.Put(ctx, filename, bytes.NewReader(payload)); err != nil {
+		e.metrics.mu.Lock()
+		e.metrics.manifestErrors++
+		e.metrics.backends[handle.Name].ManifestErrors++
+		e.metrics.mu.Unlock()
+		return err
+	}
+	state.mu.Lock()
+	if headState.version == version {
+		headState.dirty = false
+	}
+	state.mu.Unlock()
+	return nil
+}
+
+func (e *Engine) publishDirtySessionHeads(ctx context.Context, handle *storage.BackendHandle) {
+	state := e.backendState(handle.Name)
+	state.mu.Lock()
+	sessionIDs := make([]string, 0, len(state.sessionHeads))
+	for sessionID, headState := range state.sessionHeads {
+		if headState != nil && headState.dirty {
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+	}
+	state.mu.Unlock()
+	for _, sessionID := range sessionIDs {
+		if err := e.publishSessionHead(ctx, handle, sessionID); err != nil {
+			log.Printf("session head publish retry error backend=%s session=%s: %v", handle.Name, sessionID, err)
+		}
+	}
+}
+
 func (e *Engine) pollLoop(ctx context.Context) {
 	timer := time.NewTimer(e.currentPollInterval())
 	defer timer.Stop()
@@ -672,6 +838,10 @@ func (e *Engine) pollLoop(ctx context.Context) {
 }
 
 func (e *Engine) doPoll(ctx context.Context) {
+	e.doDirectPoll(ctx)
+	if e.myDir != DirRes {
+		return
+	}
 	if !e.ensureManifestContext(ctx) {
 		return
 	}
@@ -698,6 +868,83 @@ func (e *Engine) doPoll(ctx context.Context) {
 		e.applyRemoteManifest(handle.Name, manifest)
 		e.scheduleManifestChunks(ctx, handle, manifest, clientID)
 	}
+}
+
+func (e *Engine) doDirectPoll(ctx context.Context) {
+	e.sessionMu.RLock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, s := range e.sessions {
+		sessions = append(sessions, s)
+	}
+	e.sessionMu.RUnlock()
+	if len(sessions) == 0 {
+		return
+	}
+
+	for _, handle := range e.pool.Backends() {
+		for _, session := range sessions {
+			e.pollSessionHead(ctx, handle, session)
+		}
+	}
+}
+
+func (e *Engine) pollSessionHead(ctx context.Context, handle *storage.BackendHandle, session *Session) {
+	filename := sessionHeadFilename(e.peerDir, session.ID)
+	started := time.Now()
+	rc, err := handle.Backend.Download(ctx, filename)
+	if err != nil {
+		if !storage.IsNotFoundError(err) {
+			log.Printf("session head download error backend=%s session=%s: %v", handle.Name, session.ID, err)
+			e.metrics.mu.Lock()
+			e.metrics.downloadErrors++
+			e.metrics.backends[handle.Name].DownloadErrors++
+			e.metrics.mu.Unlock()
+		}
+		return
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		log.Printf("session head read error backend=%s session=%s: %v", handle.Name, session.ID, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.backends[handle.Name].DownloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+	head, err := decodeSessionHead(data)
+	if err != nil {
+		log.Printf("session head decode error backend=%s session=%s: %v", handle.Name, session.ID, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.backends[handle.Name].DownloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+	polledAt := time.Now()
+	for _, desc := range head.Chunks {
+		cacheKey := session.ID + ":" + desc.ID
+		state := e.backendState(handle.Name)
+		if state.seenChunks.Seen(cacheKey) {
+			continue
+		}
+		state.mu.Lock()
+		inFlightKey := "direct:" + cacheKey
+		if _, exists := state.inFlight[inFlightKey]; exists {
+			state.mu.Unlock()
+			continue
+		}
+		if !e.downloadLimiter.TryAcquire() {
+			state.mu.Unlock()
+			return
+		}
+		state.inFlight[inFlightKey] = struct{}{}
+		state.mu.Unlock()
+		go e.downloadDirectChunk(ctx, handle, head, desc, polledAt, inFlightKey)
+	}
+	e.metrics.mu.Lock()
+	e.metrics.backends[handle.Name].LastDownloadLatency = time.Since(started)
+	e.metrics.mu.Unlock()
 }
 
 func (e *Engine) downloadManifest(ctx context.Context, handle *storage.BackendHandle, clientID string) (*manifestFile, error) {
@@ -821,6 +1068,76 @@ func (e *Engine) downloadChunk(ctx context.Context, handle *storage.BackendHandl
 	e.deleteChunkAsync(ctx, handle, filename)
 }
 
+func (e *Engine) downloadDirectChunk(ctx context.Context, handle *storage.BackendHandle, head *sessionHeadFile, desc manifestChunk, polledAt time.Time, inFlightKey string) {
+	defer e.downloadLimiter.Release()
+
+	state := e.backendState(handle.Name)
+	defer func() {
+		state.mu.Lock()
+		delete(state.inFlight, inFlightKey)
+		state.mu.Unlock()
+	}()
+
+	filename := sessionChunkFilename(e.peerDir, head.SessionID, head.Epoch, desc.ID)
+	started := time.Now()
+	rc, err := handle.Backend.Download(ctx, filename)
+	if err != nil {
+		if !storage.IsNotFoundError(err) {
+			log.Printf("direct chunk download error backend=%s chunk=%s: %v", handle.Name, filename, err)
+			e.metrics.mu.Lock()
+			e.metrics.downloadErrors++
+			e.metrics.backends[handle.Name].DownloadErrors++
+			e.metrics.mu.Unlock()
+		}
+		return
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		log.Printf("direct chunk read error backend=%s chunk=%s: %v", handle.Name, filename, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.backends[handle.Name].DownloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+
+	envs, err := unmarshalChunkPayloads(data)
+	if err != nil {
+		log.Printf("direct chunk decode error backend=%s chunk=%s: %v", handle.Name, filename, err)
+		e.metrics.mu.Lock()
+		e.metrics.downloadErrors++
+		e.metrics.backends[handle.Name].DownloadErrors++
+		e.metrics.mu.Unlock()
+		return
+	}
+
+	for _, env := range envs {
+		if err := e.processEnvelope(env, handle.Name, head.Epoch); err != nil {
+			log.Printf("process direct envelope failed backend=%s chunk=%s session=%s seq=%d: %v", handle.Name, filename, env.SessionID, env.Seq, err)
+		}
+	}
+
+	cacheKey := head.SessionID + ":" + desc.ID
+	state.seenChunks.Mark(cacheKey)
+	latency := time.Since(started)
+	manifestLag := time.Duration(0)
+	if desc.CreatedUnixMs > 0 {
+		manifestLag = polledAt.Sub(time.UnixMilli(desc.CreatedUnixMs))
+		if manifestLag < 0 {
+			manifestLag = 0
+		}
+	}
+	e.metrics.mu.Lock()
+	e.metrics.backends[handle.Name].ProcessedChunks++
+	e.metrics.backends[handle.Name].LastDownloadLatency = latency
+	e.metrics.backends[handle.Name].ManifestLag = manifestLag
+	e.metrics.mu.Unlock()
+
+	e.deleteChunkAsync(ctx, handle, filename)
+}
+
 func (e *Engine) deleteChunkAsync(ctx context.Context, handle *storage.BackendHandle, filename string) {
 	if !e.deleteLimiter.TryAcquire() {
 		return
@@ -838,29 +1155,9 @@ func (e *Engine) deleteChunkAsync(ctx context.Context, handle *storage.BackendHa
 }
 
 func (e *Engine) processEnvelope(env *Envelope, backendName string, epoch uint64) error {
-	session := e.GetSession(env.SessionID)
-	if session == nil {
-		session = NewSession(env.SessionID)
-		session.ClientID = e.clientID()
-		session.TargetAddr = env.TargetAddr
-		session.BackendName = backendName
-		session.BackendEpoch = epoch
-		e.AddSession(session)
-		if e.OnNewSession != nil {
-			go e.OnNewSession(env.SessionID, env.TargetAddr, session)
-		}
-	} else if session.BackendEpoch != epoch {
-		session.Abort()
-		e.RemoveSession(session.ID)
-		session = NewSession(env.SessionID)
-		session.ClientID = e.clientID()
-		session.TargetAddr = env.TargetAddr
-		session.BackendName = backendName
-		session.BackendEpoch = epoch
-		e.AddSession(session)
-		if e.OnNewSession != nil {
-			go e.OnNewSession(env.SessionID, env.TargetAddr, session)
-		}
+	session, created := e.ensureSessionForEnvelope(env, backendName, epoch)
+	if created && e.OnNewSession != nil {
+		go e.OnNewSession(env.SessionID, env.TargetAddr, session)
 	}
 
 	advanced, closedNow, err := session.ProcessRx(env)
@@ -882,11 +1179,79 @@ func (e *Engine) processEnvelope(env *Envelope, backendName string, epoch uint64
 	return nil
 }
 
+func (e *Engine) ensureSessionForEnvelope(env *Envelope, backendName string, epoch uint64) (*Session, bool) {
+	opts := e.currentOptions()
+
+	var (
+		session  *Session
+		replaced *Session
+		created  bool
+		count    int
+	)
+
+	e.sessionMu.Lock()
+	session = e.sessions[env.SessionID]
+	switch {
+	case session == nil:
+		session = NewSession(env.SessionID)
+		session.ClientID = e.clientID()
+		session.TargetAddr = env.TargetAddr
+		session.BackendName = backendName
+		session.BackendEpoch = epoch
+		session.Configure(opts.MaxTxBufferBytesPerSession, opts.MaxOutOfOrderSegments, opts.SegmentBytes, e.notifyFlush, e.notifyForceFlush)
+		e.sessions[session.ID] = session
+		created = true
+	case session.BackendEpoch == 0:
+		session.BackendEpoch = epoch
+	case session.BackendEpoch != epoch:
+		replaced = session
+		session = NewSession(env.SessionID)
+		session.ClientID = e.clientID()
+		session.TargetAddr = env.TargetAddr
+		session.BackendName = backendName
+		session.BackendEpoch = epoch
+		session.Configure(opts.MaxTxBufferBytesPerSession, opts.MaxOutOfOrderSegments, opts.SegmentBytes, e.notifyFlush, e.notifyForceFlush)
+		e.sessions[session.ID] = session
+		created = true
+	default:
+		if session.TargetAddr == "" {
+			session.TargetAddr = env.TargetAddr
+		}
+		if session.BackendName == "" {
+			session.BackendName = backendName
+		}
+	}
+	count = len(e.sessions)
+	e.sessionMu.Unlock()
+
+	if replaced != nil {
+		replaced.Abort()
+	}
+	if created {
+		e.metrics.mu.Lock()
+		e.metrics.activeSessions = count
+		e.metrics.mu.Unlock()
+		log.Printf("session open %s client=%s backend=%s epoch=%d", session.ID, session.ClientID, session.BackendName, session.BackendEpoch)
+	}
+	return session, created
+}
+
 func (e *Engine) currentPollInterval() time.Duration {
 	opts := e.currentOptions()
 	e.sessionMu.RLock()
 	active := len(e.sessions)
+	turbo := false
+	now := time.Now()
+	for _, session := range e.sessions {
+		if session.NeedsTurboPoll(now) {
+			turbo = true
+			break
+		}
+	}
 	e.sessionMu.RUnlock()
+	if turbo {
+		return 40 * time.Millisecond
+	}
 	if active > 0 {
 		return opts.ActivePollRate
 	}
@@ -1109,9 +1474,10 @@ func (e *Engine) backendState(name string) *backendState {
 	}
 	opts := e.currentOptions()
 	state = &backendState{
-		name:       name,
-		seenChunks: newSeenChunkCache(opts.SeenChunkCacheSize, opts.ChunkOrphanTTL*3),
-		inFlight:   make(map[string]struct{}),
+		name:         name,
+		seenChunks:   newSeenChunkCache(opts.SeenChunkCacheSize, opts.ChunkOrphanTTL*3),
+		inFlight:     make(map[string]struct{}),
+		sessionHeads: make(map[string]*sessionHeadState),
 	}
 	e.backends[name] = state
 	e.metrics.mu.Lock()

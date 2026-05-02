@@ -247,6 +247,12 @@ func (c *AppConfig) Normalize() {
 	if c.IdlePollRateMs == 0 && c.Performance.IdlePollRateMs > 0 {
 		c.IdlePollRateMs = c.Performance.IdlePollRateMs
 	}
+	if c.ActivePollRateMs == 0 && c.PollRateMs > 0 {
+		c.ActivePollRateMs = c.PollRateMs
+	}
+	if c.IdlePollRateMs == 0 && c.PollRateMs > 0 {
+		c.IdlePollRateMs = c.PollRateMs
+	}
 	if c.SegmentBytes == 0 && c.Performance.SegmentBytes > 0 {
 		c.SegmentBytes = c.Performance.SegmentBytes
 	}

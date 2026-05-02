@@ -8,7 +8,10 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -175,6 +178,61 @@ func TestValidateFolderReturnsReauthHintForInaccessibleConfiguredFolder(t *testi
 	}
 	if !strings.Contains(err.Error(), "/tmp/credentials.json.token") {
 		t.Fatalf("expected token cache hint, got %v", err)
+	}
+}
+
+func TestLocalBackendConcurrentPut(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	backend, err := NewLocalBackend(dir)
+	if err != nil {
+		t.Fatalf("NewLocalBackend failed: %v", err)
+	}
+
+	const writers = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payload := []byte(strings.Repeat("x", 1024+i))
+			if err := backend.Put(context.Background(), "manifest-req-test.json", bytes.NewReader(payload)); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent Put failed: %v", err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") || strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("unexpected temp file left behind: %s", filepath.Join(dir, entry.Name()))
+		}
+	}
+
+	rc, err := backend.Download(context.Background(), "manifest-req-test.json")
+	if err != nil {
+		t.Fatalf("Download failed: %v", err)
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if len(body) == 0 {
+		t.Fatalf("expected final file to be non-empty")
 	}
 }
 

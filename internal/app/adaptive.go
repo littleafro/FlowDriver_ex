@@ -416,6 +416,29 @@ func adaptiveTransportCandidates(profile AdaptiveTransportProfile) []AdaptiveTra
 	return candidates
 }
 
+func adaptiveTransportPinned(cfg *config.AppConfig, backendCfg config.GoogleBackendConfig) bool {
+	return backendCfg.TokenURL != "" ||
+		cfg.TokenURL != "" ||
+		hasExplicitFronting(cfg.Transport) ||
+		hasExplicitFronting(cfg.TokenTransport) ||
+		hasExplicitFronting(backendCfg.Transport) ||
+		hasExplicitFronting(backendCfg.TokenTransport)
+}
+
+func hasExplicitFronting(transportCfg httpclient.TransportConfig) bool {
+	return transportCfg.TargetIP != "" || transportCfg.SNI != "" || transportCfg.HostHeader != ""
+}
+
+func adaptiveConfiguredProfile(cfg *config.AppConfig, backendCfg config.GoogleBackendConfig) AdaptiveTransportProfile {
+	apiTransport, tokenTransport := googleTransports(cfg, backendCfg)
+	return AdaptiveTransportProfile{
+		TargetIP:   apiTransport.TargetIP,
+		SNI:        apiTransport.SNI,
+		HostHeader: apiTransport.HostHeader,
+		TokenURL:   googleTokenURL(cfg, backendCfg, tokenTransport),
+	}
+}
+
 func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, defaultCredentialsPath string, controller *AdaptiveController) (*storage.BackendPool, error) {
 	if cfg.StorageType == "local" {
 		return BuildBackendPool(ctx, cfg, configPath, defaultCredentialsPath)
@@ -438,6 +461,9 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 
 		profile, _ := controller.TransportProfile(backendCfg.Name)
 		candidates := adaptiveTransportCandidates(profile)
+		if adaptiveTransportPinned(cfg, backendCfg) {
+			candidates = []AdaptiveTransportProfile{adaptiveConfiguredProfile(cfg, backendCfg)}
+		}
 		var (
 			handle   *storage.BackendHandle
 			loginErr error
@@ -493,6 +519,11 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 			return nil, fmt.Errorf("backend %s login failed across adaptive candidates: %w", backendCfg.Name, loginErr)
 		}
 		controller.RecordBackendProfile(backendCfg.Name, chosen)
+		if adaptiveTransportPinned(cfg, backendCfg) {
+			log.Printf("adaptive backend %s using pinned transport target_ip=%q sni=%q host_header=%q token_url=%q", backendCfg.Name, chosen.TargetIP, chosen.SNI, chosen.HostHeader, chosen.TokenURL)
+		} else {
+			log.Printf("adaptive backend %s selected transport target_ip=%q sni=%q host_header=%q token_url=%q", backendCfg.Name, chosen.TargetIP, chosen.SNI, chosen.HostHeader, chosen.TokenURL)
+		}
 
 		gb := handle.Backend.(*storage.GoogleBackend)
 		if backendCfg.FolderID == "" {

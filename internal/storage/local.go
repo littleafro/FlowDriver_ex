@@ -50,12 +50,17 @@ func (b *LocalBackend) Put(ctx context.Context, filename string, data io.Reader)
 }
 
 func (b *LocalBackend) putFile(path string, data io.Reader) error {
-	// Write to a temporary file first, then rename to avoid partial reads by the polling server
-	tmpPath := path + ".tmp"
-	f, err := os.Create(tmpPath)
+	// Write to a unique temporary file first, then rename to avoid partial reads
+	// and cross-goroutine clobbering when manifests are rewritten concurrently.
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create parent dir: %w", err)
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tmpPath := f.Name()
 
 	if _, err := io.Copy(f, data); err != nil {
 		f.Close()

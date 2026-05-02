@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +65,43 @@ func waitForManifestEpoch(t *testing.T, backend *storage.FakeBackend, dir Direct
 	}
 	t.Fatalf("timed out waiting for manifest epoch change")
 	return nil
+}
+
+func waitForManifestChunkCount(t *testing.T, backend *storage.FakeBackend, dir Direction, clientID string, want int) *manifestFile {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		manifest := readManifestFromBackend(t, backend, dir, clientID)
+		if len(manifest.Chunks) == want {
+			return manifest
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for manifest chunk count %d", want)
+	return nil
+}
+
+func readSessionHeadFromBackend(t *testing.T, backend *storage.FakeBackend, dir Direction, sessionID string) *sessionHeadFile {
+	t.Helper()
+	var rc io.ReadCloser
+	var err error
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		rc, err = backend.Download(context.Background(), sessionHeadFilename(dir, sessionID))
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("download session head: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer rc.Close()
+	var head sessionHeadFile
+	if err := json.NewDecoder(rc).Decode(&head); err != nil {
+		t.Fatalf("decode session head: %v", err)
+	}
+	return &head
 }
 
 func waitForSession(t *testing.T, engine *Engine, id string) *Session {
@@ -164,22 +203,28 @@ func TestChunkOrderDoesNotBreakSessionOrdering(t *testing.T) {
 	clientEngine.flushAll(true)
 	clientEngine.doUpload(context.Background())
 
-	manifest := readManifestFromBackend(t, backend, DirReq, "c1")
-	if len(manifest.Chunks) != 2 {
-		t.Fatalf("expected two chunks, got %d", len(manifest.Chunks))
+	clientSession.EnqueueTx([]byte("three"))
+	clientEngine.flushAll(true)
+	clientEngine.doUpload(context.Background())
+
+	head := readSessionHeadFromBackend(t, backend, DirReq, "s1")
+	if len(head.Chunks) != 2 {
+		t.Fatalf("expected two direct chunks, got %d", len(head.Chunks))
 	}
-	manifest.Chunks[0], manifest.Chunks[1] = manifest.Chunks[1], manifest.Chunks[0]
-	payload, err := encodeManifest(*manifest)
+	head.Chunks[0], head.Chunks[1] = head.Chunks[1], head.Chunks[0]
+	payload, err := encodeSessionHead(*head)
 	if err != nil {
-		t.Fatalf("encode manifest: %v", err)
+		t.Fatalf("encode session head: %v", err)
 	}
-	if err := backend.Put(context.Background(), manifestFilename(DirReq, "c1"), bytes.NewReader(payload)); err != nil {
-		t.Fatalf("rewrite manifest: %v", err)
+	if err := backend.Put(context.Background(), sessionHeadFilename(DirReq, "s1"), bytes.NewReader(payload)); err != nil {
+		t.Fatalf("rewrite session head: %v", err)
 	}
 
 	serverEngine := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), false, "c1", DefaultOptions())
-	serverEngine.doPoll(context.Background())
-	time.Sleep(150 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		serverEngine.doPoll(context.Background())
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	session := waitForSession(t, serverEngine, "s1")
 	if session == nil {
@@ -187,8 +232,9 @@ func TestChunkOrderDoesNotBreakSessionOrdering(t *testing.T) {
 	}
 	got1 := readPayload(t, session)
 	got2 := readPayload(t, session)
-	if got1 != "one" || got2 != "two" {
-		t.Fatalf("unexpected delivery order %q %q", got1, got2)
+	got3 := readPayload(t, session)
+	if got1 != "one" || got2 != "two" || got3 != "three" {
+		t.Fatalf("unexpected delivery order %q %q %q", got1, got2, got3)
 	}
 }
 
@@ -317,6 +363,107 @@ func TestEpochRolloverResetsBackendSessions(t *testing.T) {
 	}
 	if waitForSession(t, serverEngine, "s2") == nil {
 		t.Fatalf("expected new epoch session to exist")
+	}
+}
+
+func TestFirstPeerEpochBindsExistingLocalSession(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, true)
+	session := NewSession("s1")
+	session.ClientID = "c1"
+	session.TargetAddr = "example.com:80"
+	session.BackendName = "default"
+	engine.AddSession(session)
+
+	env := &Envelope{
+		SessionID:     "s1",
+		Seq:           0,
+		Kind:          KindData,
+		Payload:       []byte("hello"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env.EnsureChecksum()
+
+	if err := engine.processEnvelope(env, "default", 12345); err != nil {
+		t.Fatalf("processEnvelope failed: %v", err)
+	}
+
+	got := engine.GetSession("s1")
+	if got == nil {
+		t.Fatalf("expected existing session to remain bound")
+	}
+	if got != session {
+		t.Fatalf("expected existing local session to be reused")
+	}
+	if got.BackendEpoch != 12345 {
+		t.Fatalf("BackendEpoch = %d, want 12345", got.BackendEpoch)
+	}
+	if payload := readPayload(t, got); payload != "hello" {
+		t.Fatalf("payload = %q, want hello", payload)
+	}
+}
+
+func TestConcurrentProcessEnvelopeCreatesSessionOnce(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := newTestEngine(t, false)
+	var newSessions atomic.Int32
+	engine.OnNewSession = func(sessionID, targetAddr string, s *Session) {
+		newSessions.Add(1)
+	}
+
+	env0 := &Envelope{
+		SessionID:     "s1",
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "127.0.0.1:18080",
+		Payload:       []byte("one"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env0.EnsureChecksum()
+	env1 := &Envelope{
+		SessionID:     "s1",
+		Seq:           1,
+		Kind:          KindClose,
+		TargetAddr:    "127.0.0.1:18080",
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env1.EnsureChecksum()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		if err := engine.processEnvelope(env0, "default", 55); err != nil {
+			t.Errorf("processEnvelope env0 failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		if err := engine.processEnvelope(env1, "default", 55); err != nil {
+			t.Errorf("processEnvelope env1 failed: %v", err)
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && newSessions.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := newSessions.Load(); got != 1 {
+		t.Fatalf("OnNewSession count = %d, want 1", got)
+	}
+	session := waitForSession(t, engine, "s1")
+	if session == nil {
+		t.Fatalf("expected session to exist")
+	}
+	if payload := readPayload(t, session); payload != "one" {
+		t.Fatalf("payload = %q, want one", payload)
 	}
 }
 
