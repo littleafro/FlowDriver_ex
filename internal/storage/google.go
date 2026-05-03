@@ -40,8 +40,10 @@ type tokenCache struct {
 }
 
 type googleFile struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	CreatedTime  string `json:"createdTime"`
+	ModifiedTime string `json:"modifiedTime"`
 }
 
 type GoogleBackend struct {
@@ -466,6 +468,7 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader) error {
 	started := time.Now()
 	attempts := 0
+	var duplicateIDs []string
 	payload, err := io.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("failed to buffer put payload: %w", err)
@@ -485,6 +488,14 @@ func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader
 		}
 
 		existing, _ := b.lookupExactName(ctx, filename)
+		duplicateIDs = duplicateIDs[:0]
+		if len(existing) > 1 {
+			for _, file := range existing[1:] {
+				if file.ID != "" {
+					duplicateIDs = append(duplicateIDs, file.ID)
+				}
+			}
+		}
 		method := http.MethodPost
 		urlStr := "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
 		includeParents := true
@@ -530,6 +541,11 @@ func (b *GoogleBackend) Put(ctx context.Context, filename string, data io.Reader
 	})
 	if err == nil {
 		b.setHealth(HealthHealthy)
+		for _, duplicateID := range duplicateIDs {
+			if delErr := b.deleteFileByID(ctx, filename, duplicateID); delErr != nil && !IsNotFoundError(delErr) {
+				b.vlogf("backend %s duplicate cleanup filename=%s duplicate_id=%s err=%v", b.name, filename, duplicateID, delErr)
+			}
+		}
 	}
 	b.vlogf("backend %s op=put filename=%s bytes=%d attempts=%d elapsed=%s err=%v",
 		b.name, filename, len(payload), attempts, time.Since(started), err)
@@ -810,8 +826,9 @@ func (b *GoogleBackend) lookupExactName(ctx context.Context, filename string) ([
 	if err != nil {
 		return nil, err
 	}
-	for _, f := range files {
-		b.cacheFileID(f.Name, f.ID)
+	sortGoogleFilesNewestFirst(files)
+	if len(files) > 0 {
+		b.cacheFileID(files[0].Name, files[0].ID)
 	}
 	return files, nil
 }
@@ -837,7 +854,7 @@ func (b *GoogleBackend) queryFiles(ctx context.Context, query string) ([]googleF
 			u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
 			values := u.Query()
 			values.Set("q", query)
-			values.Set("fields", "nextPageToken,files(id,name)")
+			values.Set("fields", "nextPageToken,files(id,name,createdTime,modifiedTime)")
 			values.Set("pageSize", "1000")
 			values.Set("includeItemsFromAllDrives", "true")
 			values.Set("supportsAllDrives", "true")
@@ -901,6 +918,29 @@ func (b *GoogleBackend) fileIDForName(ctx context.Context, filename string) (str
 		return "", fmt.Errorf("file not found: %s", filename)
 	}
 	return files[0].ID, nil
+}
+
+func sortGoogleFilesNewestFirst(files []googleFile) {
+	sort.SliceStable(files, func(i, j int) bool {
+		ti := googleFileTimestamp(files[i])
+		tj := googleFileTimestamp(files[j])
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return files[i].ID > files[j].ID
+	})
+}
+
+func googleFileTimestamp(file googleFile) time.Time {
+	for _, raw := range []string{file.ModifiedTime, file.CreatedTime} {
+		if raw == "" {
+			continue
+		}
+		if ts, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
 }
 
 func (b *GoogleBackend) cacheFileID(filename, fileID string) {

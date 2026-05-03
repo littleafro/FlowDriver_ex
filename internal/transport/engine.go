@@ -320,7 +320,31 @@ func (e *Engine) StatsSnapshot() StatsSnapshot {
 	}
 }
 
+func (e *Engine) primeBackends(ctx context.Context) {
+	clientID := e.clientID()
+	if clientID == "" {
+		return
+	}
+	for _, handle := range e.pool.Backends() {
+		state := e.backendState(handle.Name)
+		state.mu.Lock()
+		state.localManifest = manifestFile{
+			Dir:      e.myDir,
+			ClientID: clientID,
+			Epoch:    e.epoch,
+			Chunks:   nil,
+		}
+		state.manifestDirty = true
+		state.manifestVersion++
+		state.mu.Unlock()
+		if err := e.publishManifest(ctx, handle); err != nil {
+			log.Printf("manifest prime error backend=%s: %v", handle.Name, err)
+		}
+	}
+}
+
 func (e *Engine) Start(ctx context.Context) {
+	e.primeBackends(ctx)
 	go e.flushLoop(ctx)
 	go e.uploadLoop(ctx)
 	go e.pollLoop(ctx)

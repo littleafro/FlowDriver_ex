@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -452,6 +453,7 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 	handles := make([]*storage.BackendHandle, 0, len(backends))
 	updatedConfig := false
 	foldersByID := make(map[string]string, len(backends))
+	var failed []string
 
 	for i, backendCfg := range backends {
 		creds := backendCfg.CredentialsPath
@@ -516,7 +518,9 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 			break
 		}
 		if handle == nil {
-			return nil, fmt.Errorf("backend %s login failed across adaptive candidates: %w", backendCfg.Name, loginErr)
+			log.Printf("warning: adaptive backend %s login failed and will be skipped: %v", backendCfg.Name, loginErr)
+			failed = append(failed, fmt.Sprintf("%s: %v", backendCfg.Name, loginErr))
+			continue
 		}
 		controller.RecordBackendProfile(backendCfg.Name, chosen)
 		if adaptiveTransportPinned(cfg, backendCfg) {
@@ -564,6 +568,12 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 		if err := cfg.Save(configPath); err != nil {
 			log.Printf("warning: failed to persist auto-discovered folder IDs: %v", err)
 		}
+	}
+	if len(handles) == 0 {
+		if len(failed) > 0 {
+			return nil, fmt.Errorf("all enabled adaptive backends failed to initialize: %s", strings.Join(failed, "; "))
+		}
+		return nil, fmt.Errorf("no enabled adaptive backends initialized")
 	}
 
 	controller.persist()

@@ -68,6 +68,7 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 	handles := make([]*storage.BackendHandle, 0, len(backends))
 	updatedConfig := false
 	foldersByID := make(map[string]string, len(backends))
+	var failed []string
 
 	for i, backendCfg := range backends {
 		creds := backendCfg.CredentialsPath
@@ -110,7 +111,9 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 
 		if err := gb.Login(ctx); err != nil {
 			handle.SetHealth(storage.HealthAuthFailed)
-			return nil, fmt.Errorf("backend %s login failed: %w", backendCfg.Name, err)
+			log.Printf("warning: backend %s login failed and will be skipped: %v", backendCfg.Name, err)
+			failed = append(failed, fmt.Sprintf("%s: %v", backendCfg.Name, err))
+			continue
 		}
 
 		if backendCfg.FolderID == "" {
@@ -151,6 +154,12 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 		if err := cfg.Save(configPath); err != nil {
 			log.Printf("warning: failed to persist auto-discovered folder IDs: %v", err)
 		}
+	}
+	if len(handles) == 0 {
+		if len(failed) > 0 {
+			return nil, fmt.Errorf("all enabled backends failed to initialize: %s", strings.Join(failed, "; "))
+		}
+		return nil, fmt.Errorf("no enabled google backends initialized")
 	}
 
 	return storage.NewBackendPool(handles...), nil

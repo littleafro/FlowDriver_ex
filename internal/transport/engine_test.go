@@ -325,6 +325,77 @@ func TestPollHotPathDoesNotListWhenClientIDKnown(t *testing.T) {
 	}
 }
 
+func TestEngineStartPrimesManifestAndSuppressesStaleBootstrap(t *testing.T) {
+	t.Parallel()
+
+	backend := storage.NewFakeBackend()
+	oldTime := time.Now().Add(-time.Minute)
+	oldChunkID := fmt.Sprintf("%013d-stale", oldTime.UnixMilli())
+	oldEnv := &Envelope{
+		SessionID:     "stale-session",
+		Seq:           0,
+		Kind:          KindOpen,
+		TargetAddr:    "127.0.0.1:18181",
+		Payload:       []byte("hello"),
+		CreatedUnixMs: oldTime.UnixMilli(),
+	}
+	oldEnv.EnsureChecksum()
+	payload, _, err := marshalChunkPayloads([]*Envelope{oldEnv}, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalChunkPayloads: %v", err)
+	}
+	if err := backend.Upload(context.Background(), chunkFilename(DirReq, "c1", 1, oldChunkID), bytes.NewReader(payload)); err != nil {
+		t.Fatalf("seed stale chunk: %v", err)
+	}
+	manifestPayload, err := json.MarshalIndent(manifestFile{
+		Dir:           DirReq,
+		ClientID:      "c1",
+		Epoch:         1,
+		UpdatedUnixMs: oldTime.UnixMilli(),
+		Chunks: []manifestChunk{{
+			ID:            oldChunkID,
+			CreatedUnixMs: oldTime.UnixMilli(),
+			SizeBytes:     len(payload),
+		}},
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal stale manifest: %v", err)
+	}
+	if err := backend.Put(context.Background(), manifestFilename(DirReq, "c1"), bytes.NewReader(manifestPayload)); err != nil {
+		t.Fatalf("seed stale manifest: %v", err)
+	}
+
+	clientOpts := DefaultOptions()
+	clientOpts.DataDir = t.TempDir()
+	client := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), true, "c1", clientOpts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.Start(ctx)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var manifest *manifestFile
+	for time.Now().Before(deadline) {
+		manifest = readManifestFromBackend(t, backend, DirReq, "c1")
+		if manifest.Epoch == client.epoch && len(manifest.Chunks) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if manifest == nil || manifest.Epoch != client.epoch || len(manifest.Chunks) != 0 {
+		if manifest == nil {
+			t.Fatalf("manifest not primed")
+		}
+		t.Fatalf("manifest not primed, got epoch=%v chunks=%v", manifest.Epoch, len(manifest.Chunks))
+	}
+
+	server := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), false, "c1", DefaultOptions())
+	server.doPoll(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	if got := server.GetSession("stale-session"); got != nil {
+		t.Fatalf("expected stale session to stay suppressed")
+	}
+}
+
 func TestEpochRolloverResetsBackendSessions(t *testing.T) {
 	t.Parallel()
 
