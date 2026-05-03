@@ -55,7 +55,7 @@ func DefaultOptions() Options {
 		Compression:                  "off",
 		CompressionMinBytes:          4096,
 		UploadInterval:               250 * time.Millisecond,
-		GapGracePeriod:               2 * time.Second,
+		GapGracePeriod:               30 * time.Second,
 		ManifestChunkWindow:          256,
 		SeenChunkCacheSize:           1024,
 		ChunkOrphanTTL:               10 * time.Minute,

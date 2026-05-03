@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"os"
@@ -164,13 +165,19 @@ func (c *AdaptiveController) selectBackend(s *transport.Session, candidates []*s
 	defer c.mu.Unlock()
 
 	var (
-		best      *storage.BackendHandle
 		bestScore = math.Inf(-1)
+		bestSet   []*storage.BackendHandle
 	)
 	for _, candidate := range candidates {
 		score := 100.0
 		if state, ok := c.state.Backends[candidate.Name]; ok {
 			score = state.Score
+		}
+		if backendStats, ok := c.lastStats.Backends[candidate.Name]; ok {
+			score -= float64(backendStats.PendingChunks) * 1.5
+			score -= backendStats.ManifestLag.Seconds() * 3
+			score -= backendStats.LastPublishLatency.Seconds() * 3
+			score -= backendStats.LastDownloadLatency.Seconds() * 3
 		}
 		switch candidate.Health() {
 		case storage.HealthHealthy:
@@ -182,15 +189,50 @@ func (c *AdaptiveController) selectBackend(s *transport.Session, candidates []*s
 		case storage.HealthAuthFailed, storage.HealthDisabled:
 			score = math.Inf(-1)
 		}
-		if score > bestScore {
+		if score > bestScore+1 {
 			bestScore = score
-			best = candidate
+			bestSet = []*storage.BackendHandle{candidate}
+			continue
+		}
+		if math.Abs(score-bestScore) <= 1 {
+			bestSet = append(bestSet, candidate)
 		}
 	}
-	if best == nil {
+	if len(bestSet) == 0 {
 		return nil, fmt.Errorf("no selectable backends available")
 	}
+	if len(bestSet) == 1 {
+		return bestSet[0], nil
+	}
+
+	best := bestSet[0]
+	bestRank := adaptiveBackendRank(sessionBackendKey(s), best.Name)
+	for _, candidate := range bestSet[1:] {
+		rank := adaptiveBackendRank(sessionBackendKey(s), candidate.Name)
+		if rank < bestRank {
+			best = candidate
+			bestRank = rank
+		}
+	}
 	return best, nil
+}
+
+func sessionBackendKey(s *transport.Session) string {
+	if s == nil {
+		return ""
+	}
+	if s.ClientID != "" {
+		return s.ClientID + ":" + s.ID
+	}
+	return s.ID
+}
+
+func adaptiveBackendRank(sessionKey, backendName string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sessionKey))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(backendName))
+	return h.Sum64()
 }
 
 func (c *AdaptiveController) RecordBackendProfile(name string, profile AdaptiveTransportProfile) {

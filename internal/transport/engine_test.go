@@ -150,6 +150,49 @@ func TestClientFlushPublishesManifestAndChunk(t *testing.T) {
 	}
 }
 
+func TestClientFlushBatchesBootstrapAcrossSessions(t *testing.T) {
+	t.Parallel()
+
+	engine, backend := newTestEngine(t, true)
+	session1 := NewSession("s1")
+	session1.ClientID = "c1"
+	session1.TargetAddr = "1.1.1.1:443"
+	engine.AddSession(session1)
+	session2 := NewSession("s2")
+	session2.ClientID = "c1"
+	session2.TargetAddr = "1.1.1.1:443"
+	engine.AddSession(session2)
+
+	session1.EnqueueTx([]byte("hello"))
+	session2.EnqueueTx([]byte("world"))
+
+	engine.flushAll(true)
+	engine.doUpload(context.Background())
+
+	manifest := readManifestFromBackend(t, backend, DirReq, "c1")
+	if len(manifest.Chunks) != 1 {
+		t.Fatalf("expected one bootstrap chunk in manifest, got %d", len(manifest.Chunks))
+	}
+
+	filename := chunkFilename(DirReq, "c1", manifest.Epoch, manifest.Chunks[0].ID)
+	rc, err := backend.Download(context.Background(), filename)
+	if err != nil {
+		t.Fatalf("download bootstrap chunk: %v", err)
+	}
+	defer rc.Close()
+	payload, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read bootstrap chunk: %v", err)
+	}
+	envs, err := unmarshalChunkPayloads(payload)
+	if err != nil {
+		t.Fatalf("unmarshal bootstrap chunk: %v", err)
+	}
+	if len(envs) != 2 {
+		t.Fatalf("expected two envelopes in batched bootstrap chunk, got %d", len(envs))
+	}
+}
+
 func TestServerPollDeliversPayloadAndDeletesChunk(t *testing.T) {
 	t.Parallel()
 
@@ -183,6 +226,58 @@ func TestServerPollDeliversPayloadAndDeletesChunk(t *testing.T) {
 	}
 	if backend.DeleteCalls(chunkName) == 0 {
 		t.Fatalf("expected processed chunk to be deleted")
+	}
+}
+
+func TestClientPollDeliversPayloadFromResponseManifest(t *testing.T) {
+	t.Parallel()
+
+	backend := storage.NewFakeBackend()
+	client := NewEngineWithPool(storage.NewSingleBackendPool("default", backend), true, "c1", DefaultOptions())
+	session := NewSession("s1")
+	session.ClientID = "c1"
+	session.TargetAddr = "1.1.1.1:443"
+	session.BackendName = "default"
+	client.AddSession(session)
+
+	env := &Envelope{
+		SessionID:     "s1",
+		Seq:           0,
+		Kind:          KindData,
+		Payload:       []byte("hello"),
+		CreatedUnixMs: time.Now().UnixMilli(),
+	}
+	env.EnsureChecksum()
+	payload, _, err := marshalChunkPayloads([]*Envelope{env}, "off", 0)
+	if err != nil {
+		t.Fatalf("marshalChunkPayloads: %v", err)
+	}
+	chunkID := newChunkID(time.Now())
+	if err := backend.Upload(context.Background(), chunkFilename(DirRes, "c1", 99, chunkID), bytes.NewReader(payload)); err != nil {
+		t.Fatalf("seed response chunk: %v", err)
+	}
+	manifestPayload, err := encodeManifest(manifestFile{
+		Dir:      DirRes,
+		ClientID: "c1",
+		Epoch:    99,
+		Chunks: []manifestChunk{{
+			ID:            chunkID,
+			CreatedUnixMs: time.Now().UnixMilli(),
+			SizeBytes:     len(payload),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("encodeManifest: %v", err)
+	}
+	if err := backend.Put(context.Background(), manifestFilename(DirRes, "c1"), bytes.NewReader(manifestPayload)); err != nil {
+		t.Fatalf("seed response manifest: %v", err)
+	}
+
+	client.doPoll(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	if got := readPayload(t, session); got != "hello" {
+		t.Fatalf("payload = %q, want hello", got)
 	}
 }
 

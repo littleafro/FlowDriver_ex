@@ -33,6 +33,9 @@ type Session struct {
 	rxChanClosed     bool
 	gapSeq           uint64
 	gapSince         time.Time
+	headPollInFlight bool
+	nextHeadPollAt   time.Time
+	headPollMisses   int
 	turboUntil       time.Time
 	txCommittedBytes uint64
 	directChunks     int
@@ -507,4 +510,49 @@ func (s *Session) SetBackendName(name string) {
 	s.mu.Lock()
 	s.BackendName = name
 	s.mu.Unlock()
+}
+
+func (s *Session) ShouldPollHead(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.rxClosed || s.headPollInFlight {
+		return false
+	}
+	if s.nextHeadPollAt.IsZero() {
+		return true
+	}
+	return !now.Before(s.nextHeadPollAt)
+}
+
+func (s *Session) MarkHeadPollStarted() {
+	s.mu.Lock()
+	s.headPollInFlight = true
+	s.mu.Unlock()
+}
+
+func (s *Session) MarkHeadPollFinished(now time.Time, found bool, hadChunks bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.headPollInFlight = false
+	if found {
+		s.headPollMisses = 0
+		switch {
+		case hadChunks:
+			s.nextHeadPollAt = now.Add(120 * time.Millisecond)
+		case s.rxSeen:
+			s.nextHeadPollAt = now.Add(250 * time.Millisecond)
+		default:
+			s.nextHeadPollAt = now.Add(400 * time.Millisecond)
+		}
+		return
+	}
+	s.headPollMisses++
+	switch {
+	case s.headPollMisses <= 2:
+		s.nextHeadPollAt = now.Add(400 * time.Millisecond)
+	case s.headPollMisses <= 5:
+		s.nextHeadPollAt = now.Add(900 * time.Millisecond)
+	default:
+		s.nextHeadPollAt = now.Add(1500 * time.Millisecond)
+	}
 }

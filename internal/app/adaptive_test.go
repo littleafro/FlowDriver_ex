@@ -1,10 +1,13 @@
 package app
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
+	"github.com/NullLatency/flow-driver/internal/storage"
+	"github.com/NullLatency/flow-driver/internal/transport"
 )
 
 func TestAdaptiveInitialEngineOptionsIgnoreManualTuning(t *testing.T) {
@@ -87,5 +90,47 @@ func TestAdaptiveTransportPinnedByExplicitFronting(t *testing.T) {
 	}
 	if profile.TokenURL != "https://www.googleapis.com/oauth2/v4/token" {
 		t.Fatalf("unexpected token URL %q", profile.TokenURL)
+	}
+}
+
+func TestAdaptiveSelectBackendDistributesEqualScoreCandidates(t *testing.T) {
+	t.Parallel()
+
+	controller, err := NewAdaptiveController(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAdaptiveController: %v", err)
+	}
+	controller.state.Backends = map[string]AdaptiveBackendState{
+		"g1": {Score: 100},
+		"g2": {Score: 100},
+		"g3": {Score: 100},
+	}
+	controller.lastStats.Backends = map[string]transport.BackendStats{
+		"g1": {},
+		"g2": {},
+		"g3": {},
+	}
+
+	candidates := []*storage.BackendHandle{
+		{Name: "g1", Weight: 1, Backend: storage.NewFakeBackend()},
+		{Name: "g2", Weight: 1, Backend: storage.NewFakeBackend()},
+		{Name: "g3", Weight: 1, Backend: storage.NewFakeBackend()},
+	}
+	for _, candidate := range candidates {
+		candidate.SetHealth(storage.HealthHealthy)
+	}
+
+	seen := make(map[string]struct{})
+	for i := 0; i < 32; i++ {
+		session := transport.NewSession(fmt.Sprintf("s-%d", i))
+		session.ClientID = "c1"
+		selected, err := controller.selectBackend(session, candidates)
+		if err != nil {
+			t.Fatalf("selectBackend: %v", err)
+		}
+		seen[selected.Name] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected equal-score backend selection to distribute, saw %v", seen)
 	}
 }
