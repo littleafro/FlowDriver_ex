@@ -29,6 +29,7 @@ type Session struct {
 	closed           bool
 	openSent         bool
 	bootstrapPending bool
+	rxSeen           bool
 	rxChanClosed     bool
 	gapSeq           uint64
 	gapSince         time.Time
@@ -343,6 +344,11 @@ func (s *Session) ProcessRx(env *Envelope) (bool, bool, error) {
 	if sawPeerClose || closeNow {
 		s.closeRxChan()
 	}
+	if advanced := len(payloads) > 0 || env.Kind == KindOpen || env.Kind == KindClose || env.Kind == KindHeartbeat; advanced {
+		s.mu.Lock()
+		s.rxSeen = true
+		s.mu.Unlock()
+	}
 	return true, closeNow, nil
 }
 
@@ -486,4 +492,19 @@ func (s *Session) DirectChunksPublished() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.directChunks
+}
+
+func (s *Session) HasRxTraffic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rxSeen
+}
+
+func (s *Session) SetBackendName(name string) {
+	if name == "" {
+		return
+	}
+	s.mu.Lock()
+	s.BackendName = name
+	s.mu.Unlock()
 }

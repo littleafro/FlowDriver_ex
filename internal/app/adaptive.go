@@ -22,8 +22,8 @@ import (
 type AdaptiveMode string
 
 const (
-	AdaptiveInteractive AdaptiveMode = "interactive"
-	AdaptiveBulk        AdaptiveMode = "bulk"
+	AdaptiveInteractive  AdaptiveMode = "interactive"
+	AdaptiveBulk         AdaptiveMode = "bulk"
 	AdaptiveQuotaBackoff AdaptiveMode = "quota_backoff"
 )
 
@@ -47,13 +47,13 @@ type AdaptiveState struct {
 }
 
 type AdaptiveController struct {
-	mu         sync.Mutex
-	statePath  string
-	state      AdaptiveState
-	engine     *transport.Engine
-	policy     *netutil.DialPolicy
-	pool       *storage.BackendPool
-	lastStats  transport.StatsSnapshot
+	mu        sync.Mutex
+	statePath string
+	state     AdaptiveState
+	engine    *transport.Engine
+	policy    *netutil.DialPolicy
+	pool      *storage.BackendPool
+	lastStats transport.StatsSnapshot
 }
 
 func NewAdaptiveController(dataDir string) (*AdaptiveController, error) {
@@ -341,7 +341,7 @@ func adaptiveTuningForMode(mode AdaptiveMode) transport.RuntimeTuning {
 			MaxOutOfOrderSegments:      128,
 			Compression:                "gzip",
 			CompressionMinBytes:        8192,
-			GapGracePeriod:             3 * time.Second,
+			GapGracePeriod:             30 * time.Second,
 		}
 	case AdaptiveQuotaBackoff:
 		return transport.RuntimeTuning{
@@ -361,7 +361,7 @@ func adaptiveTuningForMode(mode AdaptiveMode) transport.RuntimeTuning {
 			MaxOutOfOrderSegments:      32,
 			Compression:                "gzip",
 			CompressionMinBytes:        2048,
-			GapGracePeriod:             5 * time.Second,
+			GapGracePeriod:             45 * time.Second,
 		}
 	default:
 		return transport.RuntimeTuning{
@@ -381,7 +381,7 @@ func adaptiveTuningForMode(mode AdaptiveMode) transport.RuntimeTuning {
 			MaxOutOfOrderSegments:      64,
 			Compression:                "off",
 			CompressionMinBytes:        4096,
-			GapGracePeriod:             2 * time.Second,
+			GapGracePeriod:             20 * time.Second,
 		}
 	}
 }
@@ -456,9 +456,9 @@ func BuildAdaptiveBackendPool(ctx context.Context, cfg *config.AppConfig, config
 	var failed []string
 
 	for i, backendCfg := range backends {
-		creds := backendCfg.CredentialsPath
+		creds := resolveCredentialsPath(backendCfg.CredentialsPath)
 		if creds == "" {
-			creds = defaultCredentialsPath
+			creds = resolveCredentialsPath(defaultCredentialsPath)
 		}
 
 		profile, _ := controller.TransportProfile(backendCfg.Name)

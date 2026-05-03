@@ -207,6 +207,9 @@ func TestChunkOrderDoesNotBreakSessionOrdering(t *testing.T) {
 	clientEngine.flushAll(true)
 	clientEngine.doUpload(context.Background())
 
+	time.Sleep(metadataPublishMinInterval + 50*time.Millisecond)
+	clientEngine.doUpload(context.Background())
+
 	head := readSessionHeadFromBackend(t, backend, DirReq, "s1")
 	if len(head.Chunks) != 2 {
 		t.Fatalf("expected two direct chunks, got %d", len(head.Chunks))

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -71,9 +73,9 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 	var failed []string
 
 	for i, backendCfg := range backends {
-		creds := backendCfg.CredentialsPath
+		creds := resolveCredentialsPath(backendCfg.CredentialsPath)
 		if creds == "" {
-			creds = defaultCredentialsPath
+			creds = resolveCredentialsPath(defaultCredentialsPath)
 		}
 		apiTransport, tokenTransport := googleTransports(cfg, backendCfg)
 		warnGoogleTransport(backendCfg.Name, apiTransport, googleTokenURL(cfg, backendCfg, tokenTransport), tokenTransport)
@@ -163,6 +165,21 @@ func BuildBackendPool(ctx context.Context, cfg *config.AppConfig, configPath, de
 	}
 
 	return storage.NewBackendPool(handles...), nil
+}
+
+func resolveCredentialsPath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return path
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	alt := filepath.Join(filepath.Dir(path), "creds", filepath.Base(path))
+	if _, err := os.Stat(alt); err == nil {
+		log.Printf("credentials_path %q not found; using %q", path, alt)
+		return alt
+	}
+	return path
 }
 
 func trackFolderAssignment(foldersByID map[string]string, backendName, folderID string) error {

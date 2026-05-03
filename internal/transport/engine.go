@@ -32,16 +32,16 @@ type RuntimeTuning struct {
 }
 
 type BackendStats struct {
-	PendingChunks      int
-	PublishedChunks    uint64
-	ProcessedChunks    uint64
-	UploadErrors       uint64
-	DownloadErrors     uint64
-	DeleteErrors       uint64
-	ManifestErrors     uint64
-	LastPublishLatency time.Duration
+	PendingChunks       int
+	PublishedChunks     uint64
+	ProcessedChunks     uint64
+	UploadErrors        uint64
+	DownloadErrors      uint64
+	DeleteErrors        uint64
+	ManifestErrors      uint64
+	LastPublishLatency  time.Duration
 	LastDownloadLatency time.Duration
-	ManifestLag        time.Duration
+	ManifestLag         time.Duration
 }
 
 type StatsSnapshot struct {
@@ -114,34 +114,40 @@ type pendingChunk struct {
 }
 
 type sessionHeadState struct {
-	head    sessionHeadFile
-	dirty   bool
-	version uint64
+	head            sessionHeadFile
+	dirty           bool
+	publishing      bool
+	version         uint64
+	lastPublishedAt time.Time
 }
 
 type backendState struct {
 	name string
 
-	mu              sync.Mutex
-	queue           []*pendingChunk
-	localManifest   manifestFile
-	manifestDirty   bool
-	manifestVersion uint64
-	remoteEpoch     uint64
-	seenChunks      *seenChunkCache
-	inFlight        map[string]struct{}
-	sessionHeads    map[string]*sessionHeadState
+	mu                  sync.Mutex
+	queue               []*pendingChunk
+	localManifest       manifestFile
+	manifestDirty       bool
+	manifestPublishing  bool
+	manifestVersion     uint64
+	manifestPublishedAt time.Time
+	remoteEpoch         uint64
+	seenChunks          *seenChunkCache
+	inFlight            map[string]struct{}
+	sessionHeads        map[string]*sessionHeadState
 }
 
+const metadataPublishMinInterval = 500 * time.Millisecond
+
 type Engine struct {
-	pool      *storage.BackendPool
-	myDir     Direction
-	peerDir   Direction
-	idMu      sync.RWMutex
-	id        string
-	optsMu    sync.RWMutex
-	opts      Options
-	epoch     uint64
+	pool         *storage.BackendPool
+	myDir        Direction
+	peerDir      Direction
+	idMu         sync.RWMutex
+	id           string
+	optsMu       sync.RWMutex
+	opts         Options
+	epoch        uint64
 	OnNewSession func(sessionID, targetAddr string, s *Session)
 
 	sessionMu sync.RWMutex
@@ -552,15 +558,15 @@ func (e *Engine) enqueueChunk(backendName string, payload []byte, createdAt time
 		filename = sessionChunkFilename(e.myDir, sessionID, e.epoch, chunkID)
 	}
 	state.queue = append(state.queue, &pendingChunk{
-		id:        chunkID,
-		filename:  filename,
-		backend:   backendName,
-		epoch:     e.epoch,
-		createdAt: createdAt,
-		payload:   payload,
-		sizeBytes: len(payload),
-		route:     route,
-		sessionID: sessionID,
+		id:         chunkID,
+		filename:   filename,
+		backend:    backendName,
+		epoch:      e.epoch,
+		createdAt:  createdAt,
+		payload:    payload,
+		sizeBytes:  len(payload),
+		route:      route,
+		sessionID:  sessionID,
 		targetAddr: targetAddr,
 	})
 	e.updatePendingChunkMetrics(backendName, len(state.queue))
@@ -719,19 +725,25 @@ func (e *Engine) uploadChunk(ctx context.Context, handle *storage.BackendHandle,
 		state.manifestDirty = true
 		state.manifestVersion++
 	} else {
+		canonicalBackend := chunk.backend
+		if session := e.GetSession(chunk.sessionID); session != nil && session.BackendName != "" {
+			canonicalBackend = session.BackendName
+		}
 		headState := state.sessionHeads[chunk.sessionID]
 		if headState == nil {
 			headState = &sessionHeadState{
 				head: sessionHeadFile{
-					Dir:        e.myDir,
-					ClientID:   e.clientID(),
-					SessionID:  chunk.sessionID,
-					TargetAddr: chunk.targetAddr,
-					Epoch:      e.epoch,
+					Dir:         e.myDir,
+					ClientID:    e.clientID(),
+					SessionID:   chunk.sessionID,
+					BackendName: canonicalBackend,
+					TargetAddr:  chunk.targetAddr,
+					Epoch:       e.epoch,
 				},
 			}
 			state.sessionHeads[chunk.sessionID] = headState
 		}
+		headState.head.BackendName = canonicalBackend
 		headState.head.Chunks = append(headState.head.Chunks, manifestChunk{
 			ID:            chunk.id,
 			CreatedUnixMs: chunk.createdAt.UnixMilli(),
@@ -775,16 +787,31 @@ func (e *Engine) publishManifest(ctx context.Context, handle *storage.BackendHan
 		state.mu.Unlock()
 		return nil
 	}
+	if state.manifestPublishing {
+		state.mu.Unlock()
+		return nil
+	}
+	if !state.manifestPublishedAt.IsZero() && time.Since(state.manifestPublishedAt) < metadataPublishMinInterval {
+		state.mu.Unlock()
+		return nil
+	}
+	state.manifestPublishing = true
 	state.localManifest.UpdatedUnixMs = time.Now().UnixMilli()
 	version := state.manifestVersion
 	payload, err := encodeManifest(state.localManifest)
 	filename := manifestFilename(e.myDir, state.localManifest.ClientID)
 	state.mu.Unlock()
 	if err != nil {
+		state.mu.Lock()
+		state.manifestPublishing = false
+		state.mu.Unlock()
 		return err
 	}
 
 	if err := handle.Backend.Put(ctx, filename, bytes.NewReader(payload)); err != nil {
+		state.mu.Lock()
+		state.manifestPublishing = false
+		state.mu.Unlock()
 		e.metrics.mu.Lock()
 		e.metrics.manifestErrors++
 		e.metrics.backends[handle.Name].ManifestErrors++
@@ -793,8 +820,10 @@ func (e *Engine) publishManifest(ctx context.Context, handle *storage.BackendHan
 	}
 
 	state.mu.Lock()
+	state.manifestPublishing = false
 	if state.manifestVersion == version {
 		state.manifestDirty = false
+		state.manifestPublishedAt = time.Now()
 	}
 	state.mu.Unlock()
 	return nil
@@ -808,14 +837,33 @@ func (e *Engine) publishSessionHead(ctx context.Context, handle *storage.Backend
 		state.mu.Unlock()
 		return nil
 	}
+	if headState.publishing {
+		state.mu.Unlock()
+		return nil
+	}
+	if !headState.lastPublishedAt.IsZero() && time.Since(headState.lastPublishedAt) < metadataPublishMinInterval {
+		state.mu.Unlock()
+		return nil
+	}
+	headState.publishing = true
 	version := headState.version
 	payload, err := encodeSessionHead(headState.head)
 	filename := sessionHeadFilename(e.myDir, sessionID)
 	state.mu.Unlock()
 	if err != nil {
+		state.mu.Lock()
+		if current := state.sessionHeads[sessionID]; current == headState {
+			current.publishing = false
+		}
+		state.mu.Unlock()
 		return err
 	}
 	if err := handle.Backend.Put(ctx, filename, bytes.NewReader(payload)); err != nil {
+		state.mu.Lock()
+		if current := state.sessionHeads[sessionID]; current == headState {
+			current.publishing = false
+		}
+		state.mu.Unlock()
 		e.metrics.mu.Lock()
 		e.metrics.manifestErrors++
 		e.metrics.backends[handle.Name].ManifestErrors++
@@ -823,8 +871,12 @@ func (e *Engine) publishSessionHead(ctx context.Context, handle *storage.Backend
 		return err
 	}
 	state.mu.Lock()
-	if headState.version == version {
-		headState.dirty = false
+	if current := state.sessionHeads[sessionID]; current == headState {
+		current.publishing = false
+		if current.version == version {
+			current.dirty = false
+			current.lastPublishedAt = time.Now()
+		}
 	}
 	state.mu.Unlock()
 	return nil
@@ -905,8 +957,18 @@ func (e *Engine) doDirectPoll(ctx context.Context) {
 		return
 	}
 
-	for _, handle := range e.pool.Backends() {
-		for _, session := range sessions {
+	backends := e.pool.Backends()
+	for _, session := range sessions {
+		if session.HasRxTraffic() && session.BackendName != "" {
+			for _, handle := range backends {
+				if handle.Name == session.BackendName {
+					e.pollSessionHead(ctx, handle, session)
+					break
+				}
+			}
+			continue
+		}
+		for _, handle := range backends {
 			e.pollSessionHead(ctx, handle, session)
 		}
 	}
@@ -944,6 +1006,9 @@ func (e *Engine) pollSessionHead(ctx context.Context, handle *storage.BackendHan
 		e.metrics.backends[handle.Name].DownloadErrors++
 		e.metrics.mu.Unlock()
 		return
+	}
+	if head.BackendName != "" && session.BackendName != head.BackendName {
+		session.SetBackendName(head.BackendName)
 	}
 	polledAt := time.Now()
 	for _, desc := range head.Chunks {

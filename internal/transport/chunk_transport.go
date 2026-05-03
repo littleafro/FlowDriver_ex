@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	chunkFileMagic      = "FDC1"
-	chunkBatchMagic     = "FDC2"
-	chunkCompressionOff = byte(0)
+	chunkFileMagic       = "FDC1"
+	chunkBatchMagic      = "FDC2"
+	chunkCompressionOff  = byte(0)
 	chunkCompressionGzip = byte(1)
 )
 
@@ -40,6 +40,7 @@ type sessionHeadFile struct {
 	Dir           Direction       `json:"dir"`
 	ClientID      string          `json:"client_id"`
 	SessionID     string          `json:"session_id"`
+	BackendName   string          `json:"backend_name,omitempty"`
 	TargetAddr    string          `json:"target_addr,omitempty"`
 	Epoch         uint64          `json:"epoch"`
 	UpdatedUnixMs int64           `json:"updated_unix_ms"`
